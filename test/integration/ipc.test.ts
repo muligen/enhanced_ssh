@@ -273,6 +273,7 @@ test("opens an authenticated session and serves ping and target.list RPCs", asyn
         description: "Test target",
         enabled: true,
         platform: "linux",
+        connectionMode: "openssh",
         policyMode: "allow-list",
         transferMode: "deny",
         transferScope: "restricted",

@@ -403,48 +403,88 @@ test(
     const reopened = await service.fleetStatus();
     assert.equal(reopened.revision, migratedRevision);
     assert.equal(reopened.keys[0]?.keyId, migratedKeyId);
+  },
+);
 
+test(
+  "managed keys remain protected by retained and untrusted revisions",
+  { skip: process.platform !== "win32", timeout: 240_000 },
+  async (t) => {
+    const sandbox = await mkdtemp(
+      path.join(os.tmpdir(), "agent-ssh-managed-key-references-"),
+    );
+    const managedDirectory = path.join(sandbox, "managed");
+    const knownHostsSource = path.join(sandbox, "known_hosts");
+    let service: TestUiConfigurationService | undefined;
+    t.after(async () => {
+      await service?.close().catch(() => undefined);
+      await rm(sandbox, { recursive: true, force: true });
+    });
+
+    service = await createManagedSshService(managedDirectory);
+    const initialKeys = await service.generateManagedKey(
+      "initial key",
+      (await service.keyStatus()).keyRevision,
+    );
+    const initialKey = initialKeys.keys.find(
+      (candidate) => candidate.label === "initial key",
+    )!;
     const generatedRotation = await service.generateManagedKey(
       "rotation key",
-      reopened.keyRevision,
+      initialKeys.keyRevision,
     );
     const rotationKey = generatedRotation.keys.find(
       (candidate) => candidate.label === "rotation key",
     )!;
-    const renamedRotation = await service.renameManagedKey(
-      rotationKey.keyId,
-      "rotation key renamed",
-      generatedRotation.keyRevision,
+    const hostKey = initialKey.publicKey.trim().split(/\s+/u).slice(0, 2);
+    await writeFile(
+      knownHostsSource,
+      `127.0.0.1 ${hostKey.join(" ")}\n`,
+      { encoding: "utf8", mode: 0o600 },
     );
-    assert.equal(
-      renamedRotation.keys.find((candidate) => candidate.keyId === rotationKey.keyId)
-        ?.label,
-      "rotation key renamed",
-    );
-    const rotatedProfile = structuredClone(reopened.profile!);
-    for (const target of Object.values(rotatedProfile.targets)) {
-      target.target.keyId = rotationKey.keyId;
-    }
+
+    const original = await service.applyFleet({
+      version: 3,
+      targets: {
+        protected: {
+          description: "Retained key reference",
+          enabled: true,
+          target: {
+            host: "127.0.0.1",
+            port: 22,
+            username: "agent_test",
+            keyId: initialKey.keyId,
+          },
+          knownHostsFile: knownHostsSource,
+          platform: "linux",
+          policyMode: "allow-list",
+          allowedCommands: ["hostname"],
+          maxTimeoutMs: 30_000,
+        },
+      },
+    });
+    const rotatedProfile = structuredClone(original.profile!);
+    rotatedProfile.targets.protected!.target.keyId = rotationKey.keyId;
     const firstRotation = await service.applyFleet(
       rotatedProfile,
-      reopened.revision,
+      original.revision,
     );
     await assert.rejects(
-      service.removeManagedKey(migratedKeyId, renamedRotation.keyRevision),
+      service.removeManagedKey(initialKey.keyId, generatedRotation.keyRevision),
       (error: unknown) =>
         error instanceof ManagedSshError && error.code === "KEY_IN_USE",
     );
-    rotatedProfile.targets.xiaoxu_deploy!.description = "Rotation committed";
+    rotatedProfile.targets.protected!.description = "Rotation committed";
     const secondRotation = await service.applyFleet(
       rotatedProfile,
       firstRotation.revision,
     );
     const removed = await service.removeManagedKey(
-      migratedKeyId,
-      renamedRotation.keyRevision,
+      initialKey.keyId,
+      generatedRotation.keyRevision,
     );
     assert.equal(
-      removed.keys.some((candidate) => candidate.keyId === migratedKeyId),
+      removed.keys.some((candidate) => candidate.keyId === initialKey.keyId),
       false,
     );
     await service.close();
@@ -608,6 +648,7 @@ test(
           description: "Linux A",
           enabled: true,
           platform: "linux",
+          connectionMode: "openssh",
           policyMode: "allow-list",
           transferMode: "deny",
           transferScope: "restricted",
@@ -619,6 +660,7 @@ test(
           description: "Windows B",
           enabled: false,
           platform: "windows",
+          connectionMode: "openssh",
           policyMode: "full-access",
           transferMode: "bidirectional",
           transferScope: "all",
@@ -691,6 +733,7 @@ test(
           description: "Linux A retained",
           enabled: true,
           platform: "linux",
+          connectionMode: "openssh",
           policyMode: "deny",
           transferMode: "deny",
           transferScope: "restricted",
@@ -991,6 +1034,7 @@ test(
             description: "agent_test@127.0.0.1:22",
             enabled: true,
             platform: "linux",
+            connectionMode: "openssh",
             policyMode: "allow-list",
             transferMode: "deny",
             transferScope: "restricted",
