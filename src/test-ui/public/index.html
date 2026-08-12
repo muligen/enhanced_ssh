@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>SSH 管理中心</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">&gt;_</span>
+        <div>
+          <h1>SSH 管理中心</h1>
+          <p>Agent SSH Gateway</p>
+        </div>
+      </div>
+      <div class="gateway-state" aria-live="polite">
+        <span id="gateway-dot" class="status-dot is-checking" aria-hidden="true"></span>
+        <div class="gateway-state-copy">
+          <strong id="gateway-label">正在读取配置</strong>
+          <span id="gateway-detail">本机管理服务</span>
+        </div>
+        <button id="refresh-button" class="icon-button" type="button" title="刷新" aria-label="刷新管理中心">&#8635;</button>
+      </div>
+    </header>
+
+    <main id="main-content" class="app-shell" tabindex="-1">
+      <aside class="inventory" aria-labelledby="inventory-heading">
+        <div class="inventory-header">
+          <div>
+            <p class="eyebrow">机器库存</p>
+            <h2 id="inventory-heading">SSH 机器 <span id="machine-count" class="count-badge">--</span></h2>
+          </div>
+          <button id="new-machine-button" class="secondary-button compact-button" type="button" disabled>
+            <span aria-hidden="true">+</span><span>新增</span>
+          </button>
+        </div>
+        <div id="inventory-error" class="inline-alert is-error" role="alert" hidden></div>
+        <div id="machine-list" class="machine-list" role="list" aria-label="已配置的 SSH 机器" hidden></div>
+        <div id="inventory-empty" class="inventory-empty" hidden>
+          <strong>还没有机器</strong>
+          <p>新增一台机器，配置真实 SSH 地址与私钥。</p>
+        </div>
+        <div class="inventory-footer">
+          <span>配置版本</span>
+          <code id="revision-label">正在加载</code>
+        </div>
+      </aside>
+
+      <section class="workspace" aria-labelledby="workspace-title">
+        <div class="workspace-header">
+          <div class="workspace-title-wrap">
+            <div class="machine-heading-line">
+              <h2 id="workspace-title">正在加载机器配置</h2>
+              <span id="selected-state-badge" class="state-badge is-draft">加载中</span>
+            </div>
+            <p id="workspace-subtitle">正在读取本机管理服务。</p>
+          </div>
+          <div id="saved-indicator" class="saved-indicator" role="status" aria-live="polite"></div>
+        </div>
+
+        <div class="workspace-tabs" role="tablist" aria-label="机器管理视图">
+          <button id="config-tab" class="workspace-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="config-panel" tabindex="0">机器配置</button>
+          <button id="command-tab" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="command-panel" tabindex="-1" disabled>命令执行</button>
+          <button id="settings-tab" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-panel" tabindex="-1">全局设置</button>
+        </div>
+
+        <div id="config-panel" class="tab-panel" role="tabpanel" aria-labelledby="config-tab">
+          <form id="machine-form" novalidate hidden>
+            <section class="form-section" aria-labelledby="identity-heading">
+              <div class="section-heading">
+                <div>
+                  <p class="section-index">01</p>
+                  <h3 id="identity-heading">机器标识</h3>
+                </div>
+              </div>
+
+              <div class="field-grid two-columns">
+                <div class="field">
+                  <label for="target-alias">机器别名</label>
+                  <input id="target-alias" name="target-alias" type="text" maxlength="128" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="例如 prod-web-01" required>
+                  <p class="field-note">用于 Codex 选择机器，仅支持字母、数字、点、下划线和连字符。</p>
+                </div>
+                <div class="field">
+                  <label for="target-description">说明 <span class="optional">可选</span></label>
+                  <input id="target-description" name="target-description" type="text" maxlength="256" autocomplete="off" placeholder="例如 上海生产环境 Web 节点">
+                  <p class="field-note">帮助你在多台机器中快速识别用途。</p>
+                </div>
+              </div>
+
+              <fieldset class="field-group">
+                <legend>远端系统</legend>
+                <div id="platform-control" class="segmented-control three-segments">
+                  <label><input type="radio" name="platform" value="windows"><span>Windows</span></label>
+                  <label><input type="radio" name="platform" value="linux" checked><span>Linux</span></label>
+                  <label><input type="radio" name="platform" value="macos"><span>macOS</span></label>
+                </div>
+              </fieldset>
+            </section>
+
+            <section class="form-section" aria-labelledby="connection-heading">
+              <div class="section-heading">
+                <div>
+                  <p class="section-index">02</p>
+                  <h3 id="connection-heading">SSH 连接</h3>
+                </div>
+              </div>
+
+              <fieldset class="field-group connection-mode-field">
+                <legend>连接方式</legend>
+                <div id="connection-mode-control" class="segmented-control two-segments">
+                  <label><input type="radio" name="connection-mode" value="openssh" checked><span>OpenSSH 私钥</span></label>
+                  <label><input type="radio" name="connection-mode" value="accessclient-share"><span>AccessClient 已登录会话</span></label>
+                </div>
+              </fieldset>
+
+              <div class="field target-host-field">
+                <label for="target-host">目标地址</label>
+                <input id="target-host" name="target-host" type="text" maxlength="253" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="IP 地址或域名" required>
+              </div>
+
+              <div id="openssh-connection-fields">
+                <div class="field-grid openssh-endpoint-grid">
+                  <div class="field narrow-field">
+                    <label for="target-port">SSH 端口</label>
+                    <input id="target-port" name="target-port" type="number" value="22" min="1" max="65535" step="1" inputmode="numeric" required>
+                  </div>
+                  <div class="field username-field">
+                    <label for="target-username">目标账号</label>
+                    <input id="target-username" name="target-username" type="text" maxlength="128" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="user 或 portal/10.0.0.1/root" required>
+                  </div>
+                </div>
+
+                <div class="field key-select-field">
+                  <label for="target-key-id">私钥</label>
+                  <select id="target-key-id" name="target-key-id" required>
+                    <option value="">正在加载私钥...</option>
+                  </select>
+                  <div class="field-note-row">
+                    <p id="target-key-note" class="field-note">从全局私钥中选择。</p>
+                    <button id="target-manage-keys-button" class="inline-text-button" type="button">管理私钥</button>
+                  </div>
+                </div>
+
+                <div id="ssh-install-guide" class="ssh-install-guide" hidden>
+                  <div class="ssh-install-guide-header">
+                    <p class="field-note">首次连接：先用密码登录服务器，再把下方命令复制到远端终端执行，将所选私钥对应的公钥加入登录授权。</p>
+                    <button id="copy-ssh-install-command-button" class="toolbar-button" type="button">复制命令</button>
+                  </div>
+                  <pre id="ssh-install-command" class="ssh-install-command" tabindex="0" aria-label="远端公钥安装命令"></pre>
+                </div>
+
+                <div class="field">
+                  <label for="known-hosts-file">known_hosts 路径</label>
+                  <input id="known-hosts-file" class="path-input" name="known-hosts-file" type="text" maxlength="4096" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="已验证主机指纹文件的绝对路径" required>
+                  <p id="known-hosts-note" class="field-note">必须使用本机绝对路径，网关会严格校验主机指纹。</p>
+                </div>
+              </div>
+
+              <div id="accessclient-connection-fields" class="accessclient-connection-fields" hidden>
+                <div id="accessclient-prepare-panel" class="connection-status-line accessclient-prepare-panel">
+                  <span id="accessclient-prepare-dot" class="status-dot is-idle" aria-hidden="true"></span>
+                  <div class="accessclient-prepare-content">
+                    <div>
+                      <strong id="accessclient-prepare-label">AccessClient 会话尚未准备</strong>
+                      <p id="accessclient-prepare-detail">点击“检测连接”后，按提示从 AccessClient 打开这台机器。首次连接时请在 PuTTY 中核对并手动确认主机密钥。</p>
+                    </div>
+                    <div class="accessclient-prepare-actions">
+                      <button id="prepare-accessclient-button" class="secondary-button compact-button" type="button" hidden>准备会话</button>
+                      <button id="cancel-accessclient-prepare-button" class="ghost-button compact-button" type="button" hidden>取消</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="field-grid accessclient-primary-grid">
+                  <div class="field narrow-field">
+                    <label for="accessclient-target-port">SSH 端口</label>
+                    <input id="accessclient-target-port" name="accessclient-target-port" type="number" value="22" min="1" max="65535" step="1" inputmode="numeric">
+                  </div>
+                  <div class="field username-field">
+                    <label for="accessclient-gateway-username">AccessClient 账号</label>
+                    <input id="accessclient-gateway-username" name="accessclient-gateway-username" type="text" value="chenzilve" maxlength="128" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="与 AccessClient 会话一致">
+                  </div>
+                </div>
+
+                <p class="field-note accessclient-hostname-note">首次连接成功后，系统会自动保存目标主机名，后续用于防止连接到错误机器。</p>
+              </div>
+            </section>
+
+            <section class="form-section" aria-labelledby="permission-heading">
+              <div class="section-heading">
+                <div>
+                  <p class="section-index">03</p>
+                  <h3 id="permission-heading">权限管理</h3>
+                </div>
+                <span id="policy-summary" class="policy-chip is-allow">白名单</span>
+              </div>
+
+              <fieldset class="field-group">
+                <legend>访问模式</legend>
+                <div id="policy-control" class="segmented-control three-segments policy-control">
+                  <label><input type="radio" name="policy-mode" value="allow-list" checked><span>白名单</span></label>
+                  <label><input type="radio" name="policy-mode" value="full-access"><span>Full access</span></label>
+                  <label><input type="radio" name="policy-mode" value="deny"><span>禁止访问</span></label>
+                </div>
+              </fieldset>
+
+              <div id="allow-list-fields" class="permission-mode-fields">
+                <div class="field">
+                  <label for="allowed-commands">允许的命令 <span class="optional">每行一条，最多 128 条</span></label>
+                  <textarea id="allowed-commands" name="allowed-commands" rows="7" spellcheck="false" placeholder="hostname&#10;whoami" required></textarea>
+                  <p class="field-note">只允许完全匹配的单行命令，可填写平台预设之外的自定义命令。</p>
+                </div>
+
+                <div class="permission-subsection">
+                  <div class="permission-subsection-heading">
+                    <h4>受限文件传输</h4>
+                    <span id="restricted-transfer-summary" class="permission-subtitle">未授权</span>
+                  </div>
+                  <fieldset class="field-group">
+                    <legend>允许方向</legend>
+                    <div class="segmented-control four-segments">
+                      <label><input type="radio" name="transfer-mode" value="deny" checked><span>关闭</span></label>
+                      <label><input type="radio" name="transfer-mode" value="upload"><span>仅上传</span></label>
+                      <label><input type="radio" name="transfer-mode" value="download"><span>仅下载</span></label>
+                      <label><input type="radio" name="transfer-mode" value="bidirectional"><span>双向</span></label>
+                    </div>
+                  </fieldset>
+
+                  <div id="transfer-fields" class="permission-transfer-fields" hidden>
+                    <div class="field">
+                      <label for="local-root-path">本机授权目录</label>
+                      <input id="local-root-path" class="path-input" name="local-root-path" type="text" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="例如 E:\projects">
+                      <p class="field-note">Codex 只能访问这个目录下的相对路径，不能读取本机其他位置。</p>
+                    </div>
+                    <div class="field">
+                      <label for="remote-roots">远端授权目录 <span class="optional">每行一个</span></label>
+                      <textarea id="remote-roots" name="remote-roots" rows="4" spellcheck="false" placeholder="Windows: D:\services&#10;Linux/macOS: /srv/services"></textarea>
+                    </div>
+                    <div id="transfer-warning" class="risk-panel">
+                      <strong>受限文件传输需要单独确认</strong>
+                      <p>上传可能修改远端文件，下载会写入本机授权目录。保存时必须重新确认。</p>
+                      <label class="confirm-control">
+                        <input id="transfer-access-confirm" name="transfer-access-confirm" type="checkbox">
+                        <span>我已核对本机与远端目录，并确认授予 Codex 所选方向的文件访问权限。</span>
+                      </label>
+                    </div>
+                  </div>
+                  <p id="transfer-deny-note" class="section-note">文件传输默认关闭；开启后仅能访问上方明确授权的目录。</p>
+                </div>
+              </div>
+
+              <div id="full-access-warning" class="risk-panel" hidden>
+                <strong id="full-access-heading">Full access 将开放完整命令与文件权限</strong>
+                <p id="full-access-description">Codex 可以执行任意命令，并可使用任意本机或远端绝对路径双向传输文件，包括读取本机私钥、凭证等敏感文件，以及修改配置、停止服务或删除数据。每次保存都必须重新确认。</p>
+                <label class="confirm-control">
+                  <input id="full-access-confirm" name="full-access-confirm" type="checkbox">
+                  <span id="full-access-confirm-text">我已核对目标机器，并确认授予 Codex 完整命令权限和全部本机、远端文件权限。</span>
+                </label>
+              </div>
+
+              <p id="accessclient-transfer-note" class="section-note accessclient-transfer-note" hidden>AccessClient 共享模式当前只提供命令通道，文件上传、下载和目录同步固定关闭。</p>
+
+              <div id="deny-note" class="deny-panel" hidden>
+                <strong>这台机器只会出现在库存中</strong>
+                <p>Codex 可以看到机器状态，但不能执行命令或传输文件。</p>
+              </div>
+
+              <div id="permission-limits" class="permission-limits-grid">
+                <div class="field timeout-config-field">
+                  <label for="max-timeout-ms">单条命令最长时间</label>
+                  <div class="number-with-unit">
+                    <input id="max-timeout-ms" name="max-timeout-ms" type="number" value="30000" min="1" max="3600000" step="1000" inputmode="numeric" required>
+                    <span>毫秒</span>
+                  </div>
+                  <p class="field-note">允许范围 1 至 3,600,000 毫秒。</p>
+                </div>
+                <div id="transfer-timeout-field" class="field timeout-config-field" hidden>
+                  <label for="max-transfer-timeout-ms">单次传输最长时间</label>
+                  <div class="number-with-unit">
+                    <input id="max-transfer-timeout-ms" name="max-transfer-timeout-ms" type="number" value="3600000" min="1" max="3600000" step="1000" inputmode="numeric">
+                    <span>毫秒</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <div id="form-error" class="inline-alert is-error" role="alert" hidden></div>
+            <div id="form-status" class="inline-alert" role="status" aria-live="polite" hidden></div>
+
+            <div class="form-actions">
+              <button id="delete-button" class="danger-text-button" type="button" hidden>删除机器</button>
+              <div class="primary-actions">
+                <button id="check-button" class="secondary-button" type="button">检测连接</button>
+                <button id="save-button" class="primary-button" type="submit">保存配置</button>
+              </div>
+            </div>
+          </form>
+        </div>
+
+        <div id="settings-panel" class="tab-panel settings-panel" role="tabpanel" aria-labelledby="settings-tab" hidden>
+          <section class="form-section" aria-labelledby="accessclient-settings-heading">
+            <div class="section-heading accessclient-settings-heading">
+              <div>
+                <p class="section-index">AccessClient</p>
+                <h3 id="accessclient-settings-heading">PuTTY 共享连接</h3>
+              </div>
+              <span id="accessclient-settings-badge" class="state-badge is-draft">未配置</span>
+            </div>
+
+            <div id="accessclient-settings-error" class="inline-alert is-error key-alert" role="alert" hidden></div>
+            <div id="accessclient-settings-status" class="inline-alert key-alert" role="status" aria-live="polite" hidden></div>
+
+            <form id="accessclient-settings-form" class="accessclient-settings-form" novalidate>
+              <div class="field">
+                <label for="plink-executable">Plink 程序路径</label>
+                <input id="plink-executable" class="path-input" name="plink-executable" type="text" maxlength="4096" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="例如 G:\PuTTY\plink.exe">
+                <p class="field-note">使用与 AccessClient PuTTY 兼容的 plink.exe；路径保存后可供所有 AccessClient 机器复用。</p>
+              </div>
+              <div class="accessclient-settings-actions">
+                <button id="save-accessclient-settings-button" class="primary-button" type="submit">保存 Plink 路径</button>
+              </div>
+            </form>
+
+            <div class="connection-status-line accessclient-session-note">
+              <span id="accessclient-settings-dot" class="status-dot is-idle" aria-hidden="true"></span>
+              <div>
+                <strong id="accessclient-settings-label">尚未配置 Plink</strong>
+                <p id="accessclient-settings-detail">先保存 Plink 路径，再到机器配置选择 AccessClient 会话并检测连接。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="form-section" aria-labelledby="key-management-heading">
+            <div class="section-heading key-management-heading">
+              <div>
+                <p class="section-index">SSH</p>
+                <h3 id="key-management-heading">私钥管理 <span id="key-count" class="count-badge">--</span></h3>
+              </div>
+              <div class="key-heading-actions">
+                <button id="import-key-button" class="secondary-button" type="button">导入私钥</button>
+                <button id="generate-key-button" class="primary-button" type="button">生成私钥</button>
+              </div>
+            </div>
+
+            <div id="key-error" class="inline-alert is-error key-alert" role="alert" hidden></div>
+            <div id="key-status" class="inline-alert key-alert" role="status" aria-live="polite" hidden></div>
+
+            <form id="key-editor-form" class="subsection-fields key-editor" novalidate hidden>
+              <div class="key-editor-header">
+                <h4 id="key-editor-title">添加私钥</h4>
+                <button id="cancel-key-editor-button" class="inline-text-button" type="button">取消</button>
+              </div>
+              <div class="field-grid two-columns key-editor-fields">
+                <div class="field">
+                  <label for="key-label">名称</label>
+                  <input id="key-label" name="key-label" type="text" maxlength="128" autocomplete="off" placeholder="例如 部署密钥" required>
+                </div>
+                <div id="key-algorithm-field" class="field">
+                  <label for="key-algorithm">密钥算法</label>
+                  <select id="key-algorithm" name="key-algorithm">
+                    <option value="ed25519">Ed25519</option>
+                    <option value="rsa-3072">RSA 3072</option>
+                  </select>
+                </div>
+                <div id="key-source-field" class="field">
+                  <label for="key-source-path">现有私钥路径</label>
+                  <input id="key-source-path" class="path-input" name="key-source-path" type="text" maxlength="4096" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="本机私钥的绝对路径">
+                </div>
+              </div>
+              <div class="key-editor-actions">
+                <button id="key-editor-submit-button" class="primary-button" type="submit">保存</button>
+              </div>
+            </form>
+
+            <div id="key-list" class="key-list" role="list" aria-label="全局 SSH 私钥"></div>
+            <div id="key-empty" class="key-empty" hidden>
+              <strong>还没有私钥</strong>
+              <p>生成或导入一把私钥后，就可以在机器配置中选择。</p>
+            </div>
+
+            <section id="key-public-panel" class="generated-key-panel key-public-panel" aria-labelledby="key-public-heading" hidden>
+              <div class="generated-key-header">
+                <div>
+                  <h4 id="key-public-heading">公钥</h4>
+                  <p id="key-public-meta" class="field-note"></p>
+                </div>
+                <button id="copy-public-key-button" class="toolbar-button" type="button">复制公钥</button>
+              </div>
+              <pre id="public-key-output" class="public-key-output" tabindex="0" aria-label="SSH 公钥"></pre>
+              <p class="field-note">将公钥加入远端账号的 authorized_keys 后再检测连接。</p>
+            </section>
+          </section>
+        </div>
+
+        <div id="command-panel" class="tab-panel command-panel" role="tabpanel" aria-labelledby="command-tab" hidden>
+          <div id="command-target-banner" class="command-target-banner">
+            <div>
+              <span class="eyebrow">当前机器</span>
+              <strong id="command-target-name">--</strong>
+            </div>
+            <span id="command-policy-badge" class="policy-chip">--</span>
+          </div>
+
+          <div class="operation-tabs" role="tablist" aria-label="SSH 操作">
+            <button id="exec-operation-tab" class="operation-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="exec-operation-panel" data-operation="exec">执行</button>
+            <button id="transfer-operation-tab" class="operation-tab" type="button" role="tab" aria-selected="false" aria-controls="transfer-operation-panel" data-operation="transfer">文件</button>
+            <button id="inspect-operation-tab" class="operation-tab" type="button" role="tab" aria-selected="false" aria-controls="inspect-operation-panel" data-operation="inspect">检查</button>
+          </div>
+
+          <div id="exec-operation-panel" class="operation-panel" role="tabpanel" aria-labelledby="exec-operation-tab">
+          <form id="command-form" class="command-form" novalidate>
+            <fieldset class="field-group command-mode-field">
+              <legend>执行格式</legend>
+              <div class="segmented-control two-segments">
+                <label><input type="radio" name="execution-format" value="single" checked><span>单行命令</span></label>
+                <label><input type="radio" name="execution-format" value="structured"><span>结构化脚本</span></label>
+              </div>
+            </fieldset>
+
+            <div id="single-command-fields" class="field command-input-field">
+              <label for="command-input">命令</label>
+              <input id="command-input" name="command" type="text" value="hostname" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+              <p id="command-note" class="field-note">命令会由本机网关按该机器权限校验。</p>
+            </div>
+
+            <div id="structured-command-fields" class="structured-command-fields" hidden>
+              <fieldset class="field-group">
+                <legend>Shell</legend>
+                <div class="segmented-control three-segments">
+                  <label><input type="radio" name="remote-shell" value="powershell"><span>PowerShell</span></label>
+                  <label><input type="radio" name="remote-shell" value="cmd"><span>CMD</span></label>
+                  <label><input type="radio" name="remote-shell" value="bash" checked><span>Bash</span></label>
+                </div>
+              </fieldset>
+              <div class="field structured-script-field">
+                <label for="script-input">脚本</label>
+                <textarea id="script-input" name="script" rows="9" spellcheck="false"></textarea>
+              </div>
+              <div class="field">
+                <label for="working-directory">工作目录 <span class="optional">可选</span></label>
+                <input id="working-directory" class="path-input" name="working-directory" type="text" maxlength="8192" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="field">
+                <label for="environment-input">环境变量 <span class="optional">每行 KEY=VALUE</span></label>
+                <textarea id="environment-input" name="environment" rows="4" spellcheck="false"></textarea>
+              </div>
+            </div>
+
+            <div class="field run-timeout-field">
+              <label for="run-timeout-ms">超时</label>
+              <div class="number-with-unit">
+                <input id="run-timeout-ms" name="run-timeout-ms" type="number" value="10000" min="1" step="1000" inputmode="numeric" required>
+                <span>毫秒</span>
+              </div>
+            </div>
+            <label class="switch-control background-task-control">
+              <input id="background-task" name="background-task" type="checkbox">
+              <span class="switch-track" aria-hidden="true"></span>
+              <span>后台任务</span>
+            </label>
+            <div class="command-actions">
+              <button id="run-button" class="primary-button" type="submit">执行</button>
+              <button id="cancel-button" class="secondary-button danger-button" type="button" hidden>停止</button>
+            </div>
+          </form>
+          </div>
+
+          <div id="transfer-operation-panel" class="operation-panel" role="tabpanel" aria-labelledby="transfer-operation-tab" hidden>
+            <form id="transfer-form" class="transfer-test-form" novalidate>
+              <fieldset class="field-group transfer-kind-field">
+                <legend>操作</legend>
+                <div class="segmented-control three-segments">
+                  <label><input type="radio" name="transfer-kind" value="upload" checked><span>上传</span></label>
+                  <label><input type="radio" name="transfer-kind" value="download"><span>下载</span></label>
+                  <label><input type="radio" name="transfer-kind" value="sync"><span>目录同步</span></label>
+                </div>
+              </fieldset>
+              <div id="transfer-local-root-field" class="field">
+                <label for="transfer-local-root">本机授权目录</label>
+                <select id="transfer-local-root" name="transfer-local-root"></select>
+              </div>
+              <div class="field">
+                <label id="transfer-local-path-label" for="transfer-local-path">本机相对路径</label>
+                <input id="transfer-local-path" class="path-input" name="transfer-local-path" type="text" maxlength="4096" autocomplete="off" spellcheck="false" required>
+              </div>
+              <div class="field">
+                <label for="transfer-remote-path">远端绝对路径</label>
+                <input id="transfer-remote-path" class="path-input" name="transfer-remote-path" type="text" maxlength="8192" autocomplete="off" spellcheck="false" required>
+              </div>
+              <div id="transfer-checksum-field" class="field">
+                <label for="transfer-checksum">预期 SHA-256 <span class="optional">可选</span></label>
+                <input id="transfer-checksum" name="transfer-checksum" type="text" maxlength="64" autocomplete="off" spellcheck="false">
+              </div>
+              <div id="sync-options" class="field-grid two-columns" hidden>
+                <div class="field">
+                  <label for="transfer-excludes">排除规则 <span class="optional">每行一条</span></label>
+                  <textarea id="transfer-excludes" name="transfer-excludes" rows="4" spellcheck="false"></textarea>
+                </div>
+                <label class="confirm-control compact-check-control">
+                  <input id="verify-existing" name="verify-existing" type="checkbox">
+                  <span>校验远端已有文件</span>
+                </label>
+              </div>
+              <div class="transfer-switches">
+                <label class="confirm-control compact-check-control"><input id="transfer-overwrite" type="checkbox"><span>覆盖目标</span></label>
+                <label class="confirm-control compact-check-control"><input id="transfer-resume" type="checkbox" checked><span>断点续传</span></label>
+                <label class="confirm-control compact-check-control"><input id="transfer-dry-run" type="checkbox"><span>Dry run</span></label>
+              </div>
+              <div class="field run-timeout-field">
+                <label for="transfer-timeout-ms">超时</label>
+                <div class="number-with-unit">
+                  <input id="transfer-timeout-ms" type="number" value="3600000" min="1" max="3600000" step="1000" inputmode="numeric" required>
+                  <span>毫秒</span>
+                </div>
+              </div>
+              <div class="command-actions">
+                <button id="transfer-run-button" class="primary-button" type="submit">开始传输</button>
+                <button id="transfer-cancel-button" class="secondary-button danger-button" type="button" hidden>停止</button>
+              </div>
+            </form>
+          </div>
+
+          <div id="inspect-operation-panel" class="operation-panel" role="tabpanel" aria-labelledby="inspect-operation-tab" hidden>
+            <section class="inspection-band" aria-labelledby="target-info-heading">
+              <div class="inspection-heading">
+                <div><p class="eyebrow">机器身份</p><h3 id="target-info-heading">目标信息</h3></div>
+                <button id="inspect-target-button" class="secondary-button" type="button">读取目标信息</button>
+              </div>
+              <div id="target-info-status" class="inline-alert" role="status" hidden></div>
+              <dl id="target-info-grid" class="fact-grid" hidden></dl>
+            </section>
+
+            <section class="inspection-band" aria-labelledby="docker-preflight-heading">
+              <div class="inspection-heading">
+                <div><p class="eyebrow">部署检查</p><h3 id="docker-preflight-heading">Docker 预检</h3></div>
+                <button id="docker-preflight-button" class="primary-button" type="button">运行预检</button>
+              </div>
+              <div class="docker-preflight-form">
+                <div class="field">
+                  <label>操作意图</label>
+                  <div class="segmented-control three-segments">
+                    <label><input type="radio" name="docker-intent" value="create"><span>新建</span></label>
+                    <label><input type="radio" name="docker-intent" value="update" checked><span>更新</span></label>
+                    <label><input type="radio" name="docker-intent" value="inspect"><span>检查</span></label>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="docker-project-directory">项目目录 <span class="optional">可选</span></label>
+                  <input id="docker-project-directory" class="path-input" type="text" maxlength="8192" autocomplete="off" spellcheck="false">
+                </div>
+                <div class="field">
+                  <label for="docker-compose-files">Compose 文件 <span class="optional">每行一个相对路径</span></label>
+                  <textarea id="docker-compose-files" rows="3" spellcheck="false"></textarea>
+                </div>
+                <div class="field-grid two-columns">
+                  <div class="field">
+                    <label for="docker-project-name">项目名 <span class="optional">可选</span></label>
+                    <input id="docker-project-name" type="text" maxlength="63" autocomplete="off" spellcheck="false">
+                  </div>
+                  <div class="field">
+                    <label for="docker-required-free-mb">最低可用空间</label>
+                    <div class="number-with-unit"><input id="docker-required-free-mb" type="number" min="0" step="1" value="0"><span>MiB</span></div>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="docker-ports">检查端口 <span class="optional">每行 tcp:18080 或 udp:53</span></label>
+                  <textarea id="docker-ports" rows="3" spellcheck="false"></textarea>
+                </div>
+              </div>
+              <div id="docker-preflight-status" class="inline-alert" role="status" hidden></div>
+              <dl id="docker-preflight-grid" class="fact-grid" hidden></dl>
+            </section>
+          </div>
+
+          <div id="command-error" class="inline-alert is-error" role="alert" hidden></div>
+
+          <section class="output-section" aria-labelledby="output-heading">
+            <div class="output-header">
+              <div>
+                <p class="eyebrow">最近一次执行</p>
+                <h3 id="output-heading">输出</h3>
+              </div>
+              <div id="result-summary" class="result-summary is-idle" role="status" aria-live="polite">
+                <span class="summary-dot" aria-hidden="true"></span>
+                <span id="result-summary-text">等待执行</span>
+              </div>
+            </div>
+
+            <div class="output-toolbar">
+              <div class="output-tabs" role="tablist" aria-label="输出流">
+                <button id="stdout-tab" class="output-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="output-view" tabindex="0" data-stream="stdout">标准输出 <span id="stdout-count">0 B</span></button>
+                <button id="stderr-tab" class="output-tab" type="button" role="tab" aria-selected="false" aria-controls="output-view" tabindex="-1" data-stream="stderr">错误输出 <span id="stderr-count">0 B</span></button>
+              </div>
+              <div class="output-actions">
+                <button id="wrap-button" class="toolbar-button is-pressed" type="button" aria-pressed="true">自动换行</button>
+                <button id="copy-output-button" class="toolbar-button" type="button" disabled>复制</button>
+              </div>
+            </div>
+
+            <pre id="output-view" class="output-view is-wrapped is-placeholder" tabindex="0" aria-live="polite">执行结果会显示在这里。</pre>
+
+            <div class="output-footer">
+              <div>
+                <span id="retention-note" class="retention-note" hidden></span>
+                <button id="full-output-button" class="text-button" type="button" hidden>查看完整输出</button>
+              </div>
+              <nav id="pagination" class="pagination" aria-label="完整输出分页" hidden>
+                <button id="previous-page" class="secondary-button compact-button" type="button" disabled>上一段</button>
+                <span id="page-label">第 1 段</span>
+                <button id="next-page" class="secondary-button compact-button" type="button" disabled>下一段</button>
+              </nav>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>

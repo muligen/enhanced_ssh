@@ -1,0 +1,75 @@
+version: 1
+
+runtime:
+  dataDirectory: C:\ProgramData\agent-ssh-gateway
+  inlineOutputBytes: 8192
+  maxStoredOutputBytes: 10485760
+  maxTotalRetainedOutputBytes: 104857600
+  maxAuditBytes: 104857600
+  maxRetainedOutputs: 1024
+  outputTtlSeconds: 900
+  maxConcurrentExecutions: 4
+
+ssh:
+  executable: C:\Windows\System32\OpenSSH\ssh.exe
+  sftpExecutable: C:\Windows\System32\OpenSSH\sftp.exe
+  configFile: C:\ProgramData\agent-ssh-gateway\ssh_config
+  knownHostsFile: C:\ProgramData\agent-ssh-gateway\known_hosts
+  connectTimeoutSeconds: 15
+
+transfer:
+  # MCP callers only see this alias, never the absolute local path.
+  localRoots:
+    release-artifacts: D:\AgentSshTransfer\release-artifacts
+
+targets:
+  dev-linux:
+    description: Development Linux host through the existing OpenSSH config
+    sshAlias: dev-linux
+    platform: linux
+    enabled: true
+    policy:
+      mode: allow-list
+      allowedCommands:
+        - 'hostname'
+        - 'uptime'
+        - 'whoami'
+        - 'uname -a'
+      maxTimeoutMs: 30000
+    # Restricted policies still use named local roots plus remote roots.
+    transfer:
+      mode: upload
+      localRoots:
+        - release-artifacts
+      remoteRoots:
+        - '/srv/releases'
+      maxFileBytes: 10737418240
+      maxTotalBytes: 107374182400
+      maxFiles: 10000
+      maxTimeoutMs: 1800000
+
+  production-example:
+    description: Disabled production example
+    sshAlias: production-example
+    platform: linux
+    enabled: false
+    policy:
+      mode: deny
+      maxTimeoutMs: 10000
+
+  # managed-ssh is a target alias. It is unrelated to the Codex MCP service
+  # name used in [mcp_servers.agent_ssh].
+  managed-ssh:
+    # Managed targets receive an immutable ID. Old display aliases are retained
+    # automatically after a rename and resolve to the same policy record.
+    targetId: t-11111111111111111111111111111111
+    previousAliases: [old-managed-ssh]
+    description: Disabled high-risk Windows full-access example
+    sshAlias: managed-ssh
+    platform: windows
+    enabled: false
+    policy:
+      mode: full-access
+      maxTimeoutMs: 1800000
+    # Full access implies bidirectional transfer across legal local and remote
+    # absolute paths. The default transfer quotas and timeout still apply.

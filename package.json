@@ -1,0 +1,39 @@
+{
+  "name": "agent-ssh-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A policy-controlled local SSH gateway for AI agents",
+  "type": "module",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "agent-ssh": "dist/src/cli/main.js",
+    "agent-ssh-gateway": "dist/src/daemon/main.js",
+    "agent-ssh-mcp": "dist/src/mcp/main.js",
+    "agent-ssh-service": "dist/src/service/main.js",
+    "agent-ssh-test-ui": "dist/src/test-ui/main.js"
+  },
+  "scripts": {
+    "build": "npm run build:native && npm run build:typescript",
+    "build:native": "dotnet build native/windows-job-supervisor/windows-job-supervisor.csproj -c Release",
+    "build:typescript": "tsc -p tsconfig.json && node scripts/copy-test-ui-assets.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
+    "start:daemon": "node dist/src/daemon/main.js",
+    "start:cli": "node dist/src/cli/main.js",
+    "start:mcp": "node dist/src/mcp/main.js",
+    "start:service": "node dist/src/service/main.js",
+    "start:test-ui": "node dist/src/test-ui/main.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+output/
+.playwright-cli/
+native/**/bin/
+native/**/obj/
+.env
+*.log
+
+# Runtime state must live outside the source tree.
+.agent-ssh-runtime/
