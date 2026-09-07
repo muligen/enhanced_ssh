@@ -16,7 +16,7 @@ import {
 } from "../../src/shared/protocol.js";
 
 test("parseRpcRequest validates the session.open handshake", () => {
-  assert.equal(PROTOCOL_VERSION, 6);
+  assert.equal(PROTOCOL_VERSION, 7);
   const request = parseRpcRequest({
     jsonrpc: "2.0",
     id: "handshake-1",
@@ -428,6 +428,7 @@ test("public target summaries cannot contain sshAlias", () => {
       enabled: true,
       policyMode: "allow-list",
       maxTimeoutMs: 30_000,
+      maxTransferTimeoutMs: 30_000,
     }).success,
     false,
   );
@@ -444,12 +445,15 @@ test("public target summaries expose effective full-access transfer permissions"
     transferScope: "all",
     transferRoots: [],
     maxTimeoutMs: 30_000,
+    maxTransferTimeoutMs: 3_600_000,
   });
   assert.equal(parsed.success, true);
   assert.equal(parsed.data?.platform, "windows");
   assert.equal(parsed.data?.transferMode, "bidirectional");
   assert.equal(parsed.data?.transferScope, "all");
   assert.deepEqual(parsed.data?.transferRoots, []);
+  assert.equal(parsed.data?.maxTimeoutMs, 30_000);
+  assert.equal(parsed.data?.maxTransferTimeoutMs, 3_600_000);
 });
 
 test("public target summaries default legacy platform metadata to linux", () => {
@@ -459,6 +463,7 @@ test("public target summaries default legacy platform metadata to linux", () => 
     enabled: true,
     policyMode: "allow-list",
     maxTimeoutMs: 30_000,
+    maxTransferTimeoutMs: 30_000,
   });
   assert.equal(parsed.platform, "linux");
   assert.equal(parsed.transferMode, "deny");

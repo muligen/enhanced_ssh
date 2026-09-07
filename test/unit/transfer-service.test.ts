@@ -31,6 +31,7 @@ import type {
   SshRunInput,
 } from "../../src/infra/openssh-executor.js";
 import { GATEWAY_ERROR_CODES, GatewayError } from "../../src/shared/errors.js";
+import { SHARED_SHELL_TRANSFER_CHUNK_BYTES } from "../../src/infra/shared-shell-transfer.js";
 import type {
   DownloadParams,
   SyncParams,
@@ -103,6 +104,7 @@ async function createHarness(options: {
   readonly maxFiles?: number;
   readonly sftp?: FakeSftpExecutor;
   readonly ssh?: FakeSshExecutor;
+  readonly accessClient?: boolean;
 } = {}): Promise<Harness> {
   const directory = await mkdtemp(path.join(os.tmpdir(), "agent-ssh-transfer-service-"));
   const localRoot = path.join(directory, "workspace");
@@ -117,6 +119,17 @@ async function createHarness(options: {
         sshAlias: "managed-internal",
         platform,
         enabled: true,
+        ...(options.accessClient
+          ? {
+              connection: {
+                mode: "accessclient-share" as const,
+                gatewayHost: "gateway.example.test",
+                gatewayPort: 22,
+                gatewayUsername: "portal-user",
+                expectedHostname: "target-host",
+              },
+            }
+          : {}),
         policy:
           options.fullAccess === false
             ? {
@@ -322,6 +335,82 @@ test("full access preserves rooted upload compatibility", async (t) => {
   assert.deepEqual(
     harness.audit.events.map((event) => event.event),
     ["transfer.started", "transfer.completed"],
+  );
+});
+
+test("AccessClient upload uses persistent shell chunks without starting SFTP", async (t) => {
+  const contents = Buffer.alloc(SHARED_SHELL_TRANSFER_CHUNK_BYTES * 2 + 17, 0x5a);
+  const writtenChunks: Buffer[] = [];
+  let fingerprintCalls = 0;
+  const ssh = new FakeSshExecutor(async (input) => {
+    if (input.command.includes("/bin/cat")) {
+      writtenChunks.push(Buffer.from(input.stdin ?? []));
+      return sshOutcome();
+    }
+    if (isUploadPathProbeCall(input)) return sshOutcome({ stdout: "SAFE" });
+    const script = structuredCommandText(input);
+    if (script.includes("sha256sum")) {
+      fingerprintCalls += 1;
+      return fingerprintCalls <= 2
+        ? sshOutcome({ exitCode: 10, stdout: "MISSING" })
+        : sshOutcome({ stdout: fingerprint(contents) });
+    }
+    return sshOutcome();
+  });
+  const harness = await createHarness({ accessClient: true, ssh });
+  t.after(() => rm(harness.directory, { recursive: true, force: true }));
+  await writeFile(path.join(harness.localRoot, "payload.bin"), contents);
+
+  const started = harness.service.startUpload(
+    uploadParams({ localRoot: "workspace", resume: true }),
+  );
+  const status = await waitForTerminal(harness.tasks, started.runId);
+
+  assert.equal(status.state, "succeeded");
+  assert.equal(harness.sftp.calls.length, 0);
+  assert.deepEqual(Buffer.concat(writtenChunks), contents);
+  assert.deepEqual(
+    writtenChunks.map((chunk) => chunk.length),
+    [
+      SHARED_SHELL_TRANSFER_CHUNK_BYTES,
+      SHARED_SHELL_TRANSFER_CHUNK_BYTES,
+      17,
+    ],
+  );
+});
+
+test("AccessClient download reads persistent shell chunks without starting SFTP", async (t) => {
+  const contents = Buffer.alloc(SHARED_SHELL_TRANSFER_CHUNK_BYTES + 31, 0x6b);
+  let readOffset = 0;
+  const ssh = new FakeSshExecutor(async (input) => {
+    const script = structuredCommandText(input);
+    if (script.includes("sha256sum")) {
+      return sshOutcome({ stdout: fingerprint(contents) });
+    }
+    if (script.includes("dd if=")) {
+      const length = Math.min(
+        SHARED_SHELL_TRANSFER_CHUNK_BYTES,
+        contents.length - readOffset,
+      );
+      const chunk = contents.subarray(readOffset, readOffset + length);
+      readOffset += length;
+      return sshOutcome({ stdout: chunk.toString("base64") });
+    }
+    return sshOutcome();
+  });
+  const harness = await createHarness({ accessClient: true, ssh });
+  t.after(() => rm(harness.directory, { recursive: true, force: true }));
+
+  const started = harness.service.startDownload(
+    downloadParams({ localRoot: "workspace", resume: false }),
+  );
+  const status = await waitForTerminal(harness.tasks, started.runId);
+
+  assert.equal(status.state, "succeeded");
+  assert.equal(harness.sftp.calls.length, 0);
+  assert.deepEqual(
+    await readFile(path.join(harness.localRoot, "download.bin")),
+    contents,
   );
 });
 

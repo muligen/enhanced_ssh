@@ -25,6 +25,11 @@ import {
   type SftpExecutor,
   type SftpOutcome,
 } from "../infra/sftp-executor.js";
+import {
+  SHARED_SHELL_TRANSFER_CHUNK_BYTES,
+  SharedShellTransferError,
+  SharedShellTransferExecutor,
+} from "../infra/shared-shell-transfer.js";
 import { GATEWAY_ERROR_CODES, GatewayError } from "../shared/errors.js";
 import type {
   DownloadParams,
@@ -584,17 +589,28 @@ export class TransferService {
     });
     let preservePartial = params.resume;
     try {
-      await runSftp(
-        prepared,
-        buildSftpBatch([
-          {
-            operation: spool.resumed ? "reget" : "get",
-            remotePath: prepared.remotePath,
-            localPath: spool.partPath,
-          },
-        ]),
-        context.signal,
-      );
+      if (usesSharedShellTransfer(prepared)) {
+        await downloadThroughSharedShell(
+          prepared,
+          prepared.remotePath,
+          spool.partPath,
+          remoteFingerprint.size,
+          spool.resumed,
+          context.signal,
+        );
+      } else {
+        await runSftp(
+          prepared,
+          buildSftpBatch([
+            {
+              operation: spool.resumed ? "reget" : "get",
+              remotePath: prepared.remotePath,
+              localPath: spool.partPath,
+            },
+          ]),
+          context.signal,
+        );
+      }
       await chmod(spool.partPath, 0o600).catch(() => undefined);
       let localFingerprint = await fingerprintLocalSource(
         spool.partPath,
@@ -602,17 +618,28 @@ export class TransferService {
       );
       if (!fingerprintsMatch(localFingerprint, remoteFingerprint) && spool.resumed) {
         await spool.restart();
-        await runSftp(
-          prepared,
-          buildSftpBatch([
-            {
-              operation: "get",
-              remotePath: prepared.remotePath,
-              localPath: spool.partPath,
-            },
-          ]),
-          context.signal,
-        );
+        if (usesSharedShellTransfer(prepared)) {
+          await downloadThroughSharedShell(
+            prepared,
+            prepared.remotePath,
+            spool.partPath,
+            remoteFingerprint.size,
+            false,
+            context.signal,
+          );
+        } else {
+          await runSftp(
+            prepared,
+            buildSftpBatch([
+              {
+                operation: "get",
+                remotePath: prepared.remotePath,
+                localPath: spool.partPath,
+              },
+            ]),
+            context.signal,
+          );
+        }
         await chmod(spool.partPath, 0o600).catch(() => undefined);
         localFingerprint = await fingerprintLocalSource(
           spool.partPath,
@@ -770,6 +797,20 @@ export class TransferService {
         "Remote transfer staging path is outside the target's approved roots",
       );
     }
+    if (usesSharedShellTransfer(prepared)) {
+      await this.#uploadFileThroughSharedShell(
+        context,
+        prepared,
+        localPath,
+        remotePath,
+        partPath,
+        size,
+        sha256,
+        overwrite,
+        resume,
+      );
+      return;
+    }
     await assertRemoteUploadPathsSafe(
       prepared,
       remotePath,
@@ -853,6 +894,121 @@ export class TransferService {
       throw error;
     }
   }
+
+  async #uploadFileThroughSharedShell(
+    context: TaskWorkerContext,
+    prepared: PreparedTransfer,
+    localPath: string,
+    remotePath: string,
+    partPath: string,
+    size: number,
+    sha256: string,
+    overwrite: boolean,
+    resume: boolean,
+  ): Promise<void> {
+    const executor = new SharedShellTransferExecutor(prepared.generation.ssh);
+    const target = sharedShellTarget(prepared);
+    await assertRemoteUploadPathsSafe(
+      prepared,
+      remotePath,
+      partPath,
+      context.signal,
+    );
+    if (
+      !overwrite &&
+      (await readRemoteFingerprint(
+        prepared.generation.ssh,
+        prepared.authorization,
+        remotePath,
+        context.signal,
+      )) !== undefined
+    ) {
+      throw transferFailure("Remote destination already exists");
+    }
+    await ensureRemoteParents(prepared, remotePath, context.signal);
+
+    let resumeOffset = 0;
+    let resumed = false;
+    if (resume) {
+      const partialFingerprint = await readRemoteFingerprint(
+        prepared.generation.ssh,
+        prepared.authorization,
+        partPath,
+        context.signal,
+      );
+      if (partialFingerprint !== undefined && partialFingerprint.size <= size) {
+        resumeOffset = partialFingerprint.size;
+        resumed = true;
+      } else if (partialFingerprint !== undefined) {
+        await runSharedShellOperation("remove oversized remote partial file", () =>
+          executor.removeFile(target, partPath, context.signal),
+        );
+      }
+    }
+
+    try {
+      await uploadThroughSharedShell(
+        executor,
+        target,
+        localPath,
+        partPath,
+        size,
+        resumeOffset,
+        context.signal,
+      );
+      let transferredFingerprint = await readRemoteFingerprint(
+        prepared.generation.ssh,
+        prepared.authorization,
+        partPath,
+        context.signal,
+      );
+      if (!fingerprintsMatch(transferredFingerprint, { size, sha256 }) && resumed) {
+        await runSharedShellOperation("remove invalid remote partial file", () =>
+          executor.removeFile(target, partPath, context.signal),
+        );
+        await uploadThroughSharedShell(
+          executor,
+          target,
+          localPath,
+          partPath,
+          size,
+          0,
+          context.signal,
+        );
+        transferredFingerprint = await readRemoteFingerprint(
+          prepared.generation.ssh,
+          prepared.authorization,
+          partPath,
+          context.signal,
+        );
+      }
+      if (!fingerprintsMatch(transferredFingerprint, { size, sha256 })) {
+        await runSharedShellOperation("remove invalid remote partial file", () =>
+          executor.removeFile(target, partPath, context.signal),
+        );
+        throw checksumError("Uploaded file failed fingerprint verification");
+      }
+      if (overwrite) {
+        await runSharedShellOperation("publish remote file", () =>
+          executor.replaceFile(target, partPath, remotePath, context.signal),
+        );
+      } else {
+        await publishRemoteExclusive(
+          prepared,
+          partPath,
+          remotePath,
+          context.signal,
+        );
+      }
+    } catch (error) {
+      if (!resume && !context.signal.aborted) {
+        await runSharedShellOperation("remove remote partial file", () =>
+          executor.removeFile(target, partPath, context.signal),
+        ).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
 }
 
 function freezeGeneration(
@@ -863,6 +1019,129 @@ function freezeGeneration(
     sftp: generation.sftp,
     ssh: generation.ssh,
   });
+}
+
+function usesSharedShellTransfer(prepared: PreparedTransfer): boolean {
+  return prepared.authorization.target.connectionMode === "accessclient-share";
+}
+
+function sharedShellTarget(prepared: PreparedTransfer) {
+  return Object.freeze({
+    sshAlias: prepared.authorization.target.sshAlias,
+    platform: prepared.authorization.target.platform,
+  });
+}
+
+async function runSharedShellOperation<Result>(
+  operation: string,
+  worker: () => Promise<Result>,
+): Promise<Result> {
+  try {
+    return await worker();
+  } catch (error) {
+    if (error instanceof SharedShellTransferError) {
+      throw transferFailure(`Shared AccessClient session could not ${operation}`, error);
+    }
+    throw error;
+  }
+}
+
+async function uploadThroughSharedShell(
+  executor: SharedShellTransferExecutor,
+  target: ReturnType<typeof sharedShellTarget>,
+  localPath: string,
+  remotePath: string,
+  size: number,
+  offset: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > size) {
+    throw transferFailure("Remote partial file has an invalid size");
+  }
+  const source = await open(localPath, "r");
+  try {
+    if (size === 0) {
+      await runSharedShellOperation("write empty remote file", () =>
+        executor.write({
+          target,
+          remotePath,
+          bytes: Buffer.alloc(0),
+          truncate: true,
+          signal,
+        }),
+      );
+      return;
+    }
+    let position = offset;
+    const buffer = Buffer.allocUnsafe(SHARED_SHELL_TRANSFER_CHUNK_BYTES);
+    while (position < size) {
+      signal.throwIfAborted();
+      const requested = Math.min(buffer.length, size - position);
+      const { bytesRead } = await source.read(buffer, 0, requested, position);
+      if (bytesRead === 0) {
+        throw transferFailure("Local transfer staging file ended unexpectedly");
+      }
+      await runSharedShellOperation("write remote file chunk", () =>
+        executor.write({
+          target,
+          remotePath,
+          bytes: buffer.subarray(0, bytesRead),
+          truncate: position === 0,
+          signal,
+        }),
+      );
+      position += bytesRead;
+    }
+  } finally {
+    await source.close().catch(() => undefined);
+  }
+}
+
+async function downloadThroughSharedShell(
+  prepared: PreparedTransfer,
+  remotePath: string,
+  localPath: string,
+  size: number,
+  resume: boolean,
+  signal: AbortSignal,
+): Promise<void> {
+  const executor = new SharedShellTransferExecutor(prepared.generation.ssh);
+  const target = sharedShellTarget(prepared);
+  let offset = 0;
+  let partialExists = false;
+  if (resume) {
+    const partial = await optionalSafeSpoolFile(localPath);
+    if (partial !== undefined && partial.size <= size) {
+      offset = partial.size;
+      partialExists = true;
+    } else if (partial !== undefined) {
+      await removeSafeSpoolFile(localPath);
+    }
+  }
+  const destination = await open(localPath, partialExists ? "r+" : "wx");
+  try {
+    while (offset < size) {
+      signal.throwIfAborted();
+      const length = Math.min(SHARED_SHELL_TRANSFER_CHUNK_BYTES, size - offset);
+      const bytes = await runSharedShellOperation("read remote file chunk", () =>
+        executor.read({ target, remotePath, offset, length, signal }),
+      );
+      let written = 0;
+      while (written < bytes.length) {
+        const result = await destination.write(
+          bytes,
+          written,
+          bytes.length - written,
+          offset + written,
+        );
+        written += result.bytesWritten;
+      }
+      offset += bytes.length;
+    }
+    await destination.sync();
+  } finally {
+    await destination.close().catch(() => undefined);
+  }
 }
 
 async function runSftp(
@@ -1166,7 +1445,17 @@ async function ensureRemoteParents(
     commands.push({ operation: "mkdir", remotePath: current, ignoreFailure: true });
   }
   if (commands.length > 0) {
-    await runSftp(prepared, buildSftpBatch(commands), signal);
+    if (usesSharedShellTransfer(prepared)) {
+      const executor = new SharedShellTransferExecutor(prepared.generation.ssh);
+      const target = sharedShellTarget(prepared);
+      for (const command of commands) {
+        await runSharedShellOperation("create remote directory", () =>
+          executor.ensureDirectory(target, command.remotePath, signal),
+        );
+      }
+    } else {
+      await runSftp(prepared, buildSftpBatch(commands), signal);
+    }
   }
 }
 
@@ -1211,6 +1500,13 @@ async function removeRemotePartial(
   partPath: string,
   signal: AbortSignal,
 ): Promise<void> {
+  if (usesSharedShellTransfer(prepared)) {
+    const executor = new SharedShellTransferExecutor(prepared.generation.ssh);
+    await runSharedShellOperation("remove remote partial file", () =>
+      executor.removeFile(sharedShellTarget(prepared), partPath, signal),
+    );
+    return;
+  }
   await runSftp(
     prepared,
     buildSftpBatch([
@@ -1366,9 +1662,10 @@ async function prepareTransferSpool(
   >();
   for (const entry of await readdir(spoolDirectory, { withFileTypes: true })) {
     const entryPath = path.join(spoolDirectory, entry.name);
-    const stats = await requireSafeSpoolFile(entryPath);
+    const stats = await optionalSafeSpoolFile(entryPath);
+    if (stats === undefined) continue;
     if (entry.name.endsWith(".upload") || entry.name.endsWith(".download.lock")) {
-      await unlink(entryPath);
+      await removeSafeSpoolFile(entryPath);
       continue;
     }
     const partId = DOWNLOAD_PART_PATTERN.exec(entry.name)?.[1];
@@ -1573,7 +1870,11 @@ async function optionalSafeSpoolFile(
 
 async function removeSafeSpoolFile(filePath: string): Promise<void> {
   const stats = await optionalSafeSpoolFile(filePath);
-  if (stats !== undefined) await unlink(filePath);
+  if (stats !== undefined) {
+    await unlink(filePath).catch((error: unknown) => {
+      if (!isNodeErrorCause(error, "ENOENT")) throw error;
+    });
+  }
 }
 
 async function publishDownloadedFile(

@@ -40,7 +40,7 @@ managed lease 复用 daemon runtime lease 的所有者令牌和陈旧锁回收�
 
 应用层堡垒机透传目标不是 `ProxyJump`：它通过结构化三段用户名让入口 SSH 服务选择后端资产。每个透传会话必须作为独立目标，不能同时再配置页面中的堡垒机跳转。此模式下 host-key 校验和 `ssh_target_info` 看到的是透传入口的 SSH 主机密钥；Gateway 不声称取得或验证后端资产本身的主机密钥。管理员必须通过独立可信渠道核验入口指纹。
 
-HTTP server 固定绑定 `127.0.0.1`，默认使用随机空闲端口；即使指定 `--port`，也不能改为 `localhost`、通配地址、IPv6 任意地址或外部网卡。每次启动生成独立的 256-bit UI session token，启动 URL 通过 fragment 携带它，因此 token 不会进入初始 HTTP 请求、Referer 或服务端访问日志。页面读取后立即清除 fragment，并把 token 仅存入当前标签页的 `sessionStorage`，以便刷新后继续使用；不写 cookie 或 `localStorage`，关闭标签页或服务重启后失效。
+HTTP server 固定绑定 `127.0.0.1`，产品入口默认端口 52075；不能绑定外部网卡。每次启动生成独立的 256-bit 首次授权 token，启动 URL 通过 fragment 携带它，页面读取后立即清除 fragment。首次鉴权成功后签发 HttpOnly、SameSite=Strict、Path=/、30 天滚动有效期 Cookie；之后不需要 URL token 或浏览器 JavaScript 存储。Cookie 的 HMAC-SHA256 签名绑定完整 origin 和到期时间，托管目录 browser-session.key 保存经 ACL 加固的随机签名密钥，因此服务重启不会撤销浏览器授权。Cookie 名包含端口；Cookie 本身不能由浏览器按端口隔离，其他本机服务仍属于同一账户信任边界。本机 HTTP 不设置 Secure，部署不得改为对外 HTTP。
 
 UI token 与 `runtime.json` 中的 gateway token 完全独立。Node 后端读取 gateway token 以建立 Named Pipe 会话，但不会把它、内部 RPC request ID 或 daemon 的 `outputRef` 返回浏览器。MCP 的 `ssh_open_admin` 由本机 MCP 进程调用 Windows 默认浏览器打开带 token 的 URL，只向 Agent 返回是否成功，不把 URL 或管理员 token 放入 MCP 结果。需要分页读取输出时，后端只向页面返回另一枚随机 `resultId`，并在内存中以有界、按过期时间清理的映射保存实际 `outputRef`。
 
@@ -49,7 +49,7 @@ UI token 与 `runtime.json` 中的 gateway token 完全独立。Node 后端读�
 - `Host` 精确等于当前 `127.0.0.1:PORT`
 - `Origin` 精确等于当前本机 origin
 - `Sec-Fetch-Site` 存在时只能是 `same-origin`
-- `X-Agent-SSH-UI-Token` 自定义 header 通过恒定时间比较
+- 首次授权 header 通过恒定时间比较，或 Cookie 签名及有效期校验通过
 
 管理中心不返回 CORS 许可，跨站预检和其他 HTTP 方法会被拒绝。上述检查共同防御恶意网页发起的 CSRF 和 DNS rebinding；请求体、连接数、header 数量及接收时间也有硬上限。静态资源只从固定文件清单加载，不提供任意路径或目录浏览。
 
@@ -57,7 +57,7 @@ UI token 与 `runtime.json` 中的 gateway token 完全独立。Node 后端读�
 
 管理中心同时最多接受一个同步前台操作；其取消按钮和未完成的响应断开会通过原 RPC request ID 请求取消。通过任务接口启动的执行和传输则由 daemon 并发上限控制，HTTP/MCP 请求结束或断开不会隐式取消，必须使用 `runId` 显式取消。管理服务收到退出信号时会先停止 HTTP server；daemon 关闭会取消活动任务并等待收尾。若进程被强制终止，Job Object 仍负责清理本机受管进程树。
 
-loopback 和 UI token 主要隔离普通网页，不构成同一 Windows 账户内的沙箱。恶意本机进程、调试器或高权限浏览器扩展仍可能读取页面或进程内存；这类威胁必须使用本节开头所述的独立 Windows 身份和 OS 级隔离处理。不要分享完整管理 URL；怀疑 UI token 泄露时应重启管理服务以轮换 token。
+loopback 和 UI token 主要隔离普通网页，不构成同一 Windows 账户内的沙箱。恶意本机进程、调试器或高权限浏览器扩展仍可能读取页面或进程内存；这类威胁必须使用独立 Windows 身份和 OS 级隔离处理。不要分享完整管理 URL。撤销所有浏览器授权时，停止服务、删除托管目录中的 browser-session.key 后重启；仅重启会轮换首次授权 token，不会撤销现有 Cookie。
 
 ## SSH 约束
 

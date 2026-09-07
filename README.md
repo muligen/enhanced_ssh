@@ -84,7 +84,7 @@ Gateway runtime: C:\Users\YOUR_NAME\AppData\Local\agent-ssh-gateway\managed\runt
 Press Ctrl+C to stop.
 ```
 
-打开完整的管理 URL。页面读取 fragment token 后会立即从地址栏清除它，并只在当前标签页的 `sessionStorage` 中保留会话。关闭标签页或重启服务后，可使用 MCP 工具 `ssh_open_admin`，或重新打开服务输出的新 URL。
+首次在每个浏览器中打开完整的管理 URL 即可授权。页面会清除 fragment，通过 HttpOnly、SameSite=Strict Cookie 记住授权，之后直接打开固定地址 `http://127.0.0.1:52075/` 即可。关闭标签页或重启服务不影响授权；连续 30 天未使用后需要通过 `ssh_open_admin` 或最新完整管理 URL 再次授权。令牌不写入浏览器存储，历史 sessionStorage 凭据在授权成功后清除。
 
 默认托管目录是：
 
@@ -98,7 +98,7 @@ Press Ctrl+C to stop.
 npm run start:service -- --managed-directory C:\AgentSsh\managed --port 8765
 ```
 
-`--port 0` 是默认值，表示使用随机空闲端口。管理中心始终只监听 `127.0.0.1`。托管目录必须位于本地固定磁盘，不能是磁盘根、UNC/映射网络盘、device path、ADS 或包含 reparse point 的路径。
+产品入口默认使用固定端口 `52075`，显式指定 `--port 0` 时使用随机空闲端口。管理中心始终只监听 `127.0.0.1`。托管目录必须位于本地固定磁盘，不能是磁盘根、UNC/映射网络盘、device path、ADS 或包含 reparse point 的路径。
 
 ## 配置 OpenSSH 目标
 

@@ -9,6 +9,7 @@ import {
 } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { BrowserSession } from "../service/browser-session.js";
 
 import { z } from "zod";
 
@@ -214,6 +215,7 @@ export interface TestUiServerOptions {
   readonly legacySetupRoutes?: boolean;
   readonly port?: number;
   readonly sessionToken?: string;
+  readonly browserSessionSecret?: string;
   readonly assetDirectory?: string;
   readonly onError?: (error: unknown) => void;
 }
@@ -243,6 +245,7 @@ export async function startTestUiServer(
 ): Promise<RunningTestUiServer> {
   const port = validatePort(options.port ?? 0);
   const sessionToken = options.sessionToken ?? randomBytes(32).toString("base64url");
+  const browserSession = new BrowserSession(options.browserSessionSecret ?? randomBytes(32).toString("base64url"));
   if (!UI_TOKEN_PATTERN.test(sessionToken)) {
     throw new TypeError("sessionToken must be a 256-bit base64url value");
   }
@@ -298,7 +301,8 @@ export async function startTestUiServer(
     if (request.method !== "POST") {
       throw new HttpProblem(405, "METHOD_NOT_ALLOWED", "Method is not allowed");
     }
-    assertBrowserApiRequest(request, expectedOrigin, sessionToken);
+    assertBrowserApiRequest(request, expectedOrigin, sessionToken, browserSession);
+    response.setHeader("Set-Cookie", browserSession.issue(expectedOrigin));
     cleanupResultReferences(resultReferences);
 
     switch (route) {
@@ -1244,6 +1248,7 @@ function assertBrowserApiRequest(
   request: IncomingMessage,
   expectedOrigin: string,
   sessionToken: string,
+  browserSession: BrowserSession,
 ): void {
   if (request.headers.origin !== expectedOrigin) {
     throw new HttpProblem(403, "INVALID_ORIGIN", "Request origin was rejected");
@@ -1254,8 +1259,8 @@ function assertBrowserApiRequest(
   }
   const providedToken = request.headers["x-agent-ssh-ui-token"];
   if (
-    typeof providedToken !== "string" ||
-    !constantTimeTextEquals(providedToken, sessionToken)
+    !(typeof providedToken === "string" && constantTimeTextEquals(providedToken, sessionToken)) &&
+    !browserSession.accepts(request.headers.cookie, expectedOrigin)
   ) {
     throw new HttpProblem(403, "INVALID_SESSION", "Test UI session was rejected");
   }

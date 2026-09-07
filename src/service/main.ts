@@ -2,6 +2,7 @@
 
 import path from "node:path";
 import process from "node:process";
+import { loadBrowserSessionSecret } from "./browser-session.js";
 
 import { GATEWAY_VERSION } from "../shared/version.js";
 import {
@@ -53,7 +54,7 @@ function parseArguments(argv: readonly string[]): ServiceArguments {
 
   let managedDirectory = defaultManagedSshDirectory();
   let managedDirectorySpecified = false;
-  let port = 0;
+  let port = 52075;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--managed-directory") {
@@ -112,6 +113,7 @@ async function run(args: ServiceArguments): Promise<void> {
   let runError: unknown;
   try {
     server = await startTestUiServer({
+      browserSessionSecret: await loadBrowserSessionSecret(args.managedDirectory),
       gatewayFactory: configurationService.gatewayFactory,
       configurationService,
       ...(accessClientSessionPreparer === undefined

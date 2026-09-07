@@ -4,6 +4,7 @@ import type { GatewayConfig, TargetConfig } from "../config/load-config.js";
 import { GATEWAY_ERROR_CODES, GatewayError } from "../shared/errors.js";
 import {
   MAX_COMMAND_BYTES,
+  MAX_TIMEOUT_MS,
   TARGET_ALIAS_PATTERN,
   type TargetConnectionMode,
   type TargetSummary,
@@ -22,6 +23,7 @@ export interface RegisteredTarget {
   readonly transferScope: TargetSummary["transferScope"];
   readonly transferRoots: readonly string[];
   readonly maxTimeoutMs: number;
+  readonly maxTransferTimeoutMs: number;
 }
 
 export interface TargetAuthorization {
@@ -64,7 +66,7 @@ function compareAliases(left: string, right: string): number {
 
 function createEntry(alias: string, config: RegistryTargetConfig): RegistryEntry {
   const unrestrictedTransfer =
-    config.policy.mode === "full-access" && config.connection === undefined;
+    config.policy.mode === "full-access";
   const target: RegisteredTarget = Object.freeze({
     targetId: config.targetId ?? legacyTargetId(alias, config.sshAlias),
     alias,
@@ -79,9 +81,7 @@ function createEntry(alias: string, config: RegistryTargetConfig): RegistryEntry
         ? "accessclient-share"
         : "openssh",
     policyMode: config.policy.mode,
-    transferMode: config.connection !== undefined
-      ? "deny"
-      : unrestrictedTransfer
+    transferMode: unrestrictedTransfer
       ? "bidirectional"
       : (config.transfer?.mode ?? "deny"),
     transferScope: unrestrictedTransfer ? "all" : "restricted",
@@ -89,6 +89,9 @@ function createEntry(alias: string, config: RegistryTargetConfig): RegistryEntry
       unrestrictedTransfer ? [] : [...(config.transfer?.localRoots ?? [])],
     ),
     maxTimeoutMs: config.policy.maxTimeoutMs,
+    maxTransferTimeoutMs:
+      config.transfer?.maxTimeoutMs ??
+      (unrestrictedTransfer ? MAX_TIMEOUT_MS : config.policy.maxTimeoutMs),
   });
 
   const allowedCommands =
@@ -118,6 +121,7 @@ function toSummary(target: RegisteredTarget): TargetSummary {
     transferScope: target.transferScope,
     transferRoots: [...target.transferRoots],
     maxTimeoutMs: target.maxTimeoutMs,
+    maxTransferTimeoutMs: target.maxTransferTimeoutMs,
   });
 }
 
@@ -345,7 +349,7 @@ export class TargetRegistry {
         "Configured local transfer root is unavailable",
       );
     }
-    const maximumTimeoutMs = transfer?.maxTimeoutMs ?? target.maxTimeoutMs;
+    const maximumTimeoutMs = target.maxTransferTimeoutMs;
     if (
       requestedTimeoutMs !== undefined &&
       (!Number.isSafeInteger(requestedTimeoutMs) ||

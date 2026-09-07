@@ -196,6 +196,7 @@ async function startTestGateway(
                 platform: "linux",
                 policyMode: "allow-list",
                 maxTimeoutMs: 5_000,
+                maxTransferTimeoutMs: 5_000,
               },
             ],
           };

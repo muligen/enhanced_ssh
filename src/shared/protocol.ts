@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import type { GatewayErrorCode } from "./errors.js";
 
-export const PROTOCOL_VERSION = 6 as const;
+export const PROTOCOL_VERSION = 7 as const;
 export const MAX_RPC_FRAME_BYTES = 1_048_576;
 export const MAX_COMMAND_BYTES = 65_536;
 export const MAX_TIMEOUT_MS = 3_600_000;
@@ -94,6 +94,7 @@ export const targetSummarySchema = z.strictObject({
   transferScope: z.enum(["restricted", "all"]).default("restricted"),
   transferRoots: z.array(targetAliasSchema).max(32).default([]),
   maxTimeoutMs: z.number().int().min(1).max(MAX_TIMEOUT_MS),
+  maxTransferTimeoutMs: z.number().int().min(1).max(MAX_TIMEOUT_MS),
 });
 export type TargetSummary = z.infer<typeof targetSummarySchema>;
 

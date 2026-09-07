@@ -26,12 +26,27 @@ import {
   SshExecutionError,
   type OutputSink,
 } from "../../src/infra/ssh-runner.js";
+import { SHARED_SHELL_TRANSFER_CHUNK_BYTES } from "../../src/infra/shared-shell-transfer.js";
 
 const TARGET_ALIAS = "accessclient-target";
 const EXPECTED_HOSTNAME = "target-host";
 const SESSION_NONCE = "0123456789abcdef0123456789abcdef";
 const COMMAND_NONCE = "fedcba9876543210fedcba9876543210";
 const WINDOWS_BOOTSTRAP_NONCE = "d2299094d30f46f7a44cdcc35bc1b64e";
+
+test("shared-shell transfer chunks fit within one persistent protocol frame", () => {
+  assert.equal(SHARED_SHELL_TRANSFER_CHUNK_BYTES, 96 * 1024);
+  const frame = buildPuttyCommandFrame(
+    SESSION_NONCE,
+    1,
+    COMMAND_NONCE,
+    {
+      command: "transfer-chunk",
+      stdin: Buffer.alloc(SHARED_SHELL_TRANSFER_CHUNK_BYTES),
+    },
+  );
+  assert.ok(frame.byteLength < 256 * 1024);
+});
 
 interface FakeCommandPlan {
   readonly behavior?: "complete" | "hang" | "incomplete" | "invalid-frame";

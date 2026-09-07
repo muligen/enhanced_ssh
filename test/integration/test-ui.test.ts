@@ -31,6 +31,31 @@ import {
 
 const TEST_SESSION_TOKEN = Buffer.alloc(32, 0x5a).toString("base64url");
 
+test("cookie authorizes a reopened page and service restart while rejecting cross-origin and missing credentials", async () => {
+  const secret = "persistent-test-secret";
+  let server = await startTestUiServer({ mode: "demo", gatewayFactory: createDemoGatewayFactory(), browserSessionSecret: secret });
+  try {
+    const login = await postJson(server, "/api/ping", {});
+    assert.equal(login.status, 200);
+    const setCookie = login.headers.get("set-cookie")!;
+    assert.match(setCookie, /HttpOnly; SameSite=Strict; Max-Age=2592000/u);
+    const cookie = setCookie.split(";", 1)[0]!;
+    const port = server.port;
+    const oldToken = server.sessionToken;
+    await server.close();
+    server = await startTestUiServer({ mode: "demo", gatewayFactory: createDemoGatewayFactory(), browserSessionSecret: secret, port });
+    assert.notEqual(server.sessionToken, oldToken);
+    const request = (origin: string, includeCookie = true) => fetch(`${server.origin}/api/targets`, {
+      method: "POST", headers: { Origin: origin, "Content-Type": "application/json", ...(includeCookie ? { Cookie: cookie } : {}) }, body: "{}",
+    });
+    assert.equal((await request(server.origin)).status, 200);
+    assert.equal((await request("http://attacker.invalid")).status, 403);
+    assert.equal((await request(server.origin, false)).status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
 interface JsonObject {
   readonly [key: string]: unknown;
 }
@@ -277,6 +302,7 @@ test("forwards ping and exposes only public target summaries", async (t) => {
       transferScope: "restricted",
       transferRoots: [],
       maxTimeoutMs: 30_000,
+      maxTransferTimeoutMs: 30_000,
     },
     {
       targetId: "t-00000000000000000000000000000002",
@@ -290,6 +316,7 @@ test("forwards ping and exposes only public target summaries", async (t) => {
       transferScope: "restricted",
       transferRoots: [],
       maxTimeoutMs: 10_000,
+      maxTransferTimeoutMs: 10_000,
     },
   ]);
   assert.equal(JSON.stringify(targets).includes("sshAlias"), false);

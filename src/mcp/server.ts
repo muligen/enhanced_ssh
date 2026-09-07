@@ -105,7 +105,7 @@ export function createMcpServer(
     "ssh_gateway_status",
     {
       description:
-        "Report whether the local SSH management service and Gateway are ready, plus the configured target summaries.",
+        "Report whether the local SSH management service and Gateway are ready, plus configured target summaries. In each target, maxTimeoutMs is the command limit and maxTransferTimeoutMs is the independent upload/download/sync limit.",
       outputSchema: gatewayStatusResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
@@ -187,7 +187,7 @@ export function createMcpServer(
     "ssh_list_targets",
     {
       description:
-        "List immutable SSH target IDs, current display aliases, remote platforms, and effective command and file-transfer policy status. Tools accept either the targetId or a current/retained alias.",
+        "List immutable SSH target IDs, current display aliases, remote platforms, and effective command and file-transfer policy status. maxTimeoutMs applies to commands; maxTransferTimeoutMs independently applies to upload/download/sync. Tools accept either the targetId or a current/retained alias.",
       outputSchema: targetListResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
@@ -323,7 +323,7 @@ export function createMcpServer(
     "ssh_upload",
     {
       description:
-        "Start an SFTP upload. Restricted targets require an approved localRoot and a relative localPath. Full-access targets may omit localRoot and use a gateway-local absolute localPath; remotePath must be a legal target-native absolute path. expectedSha256 accepts uppercase or lowercase hexadecimal.",
+        "Start a file upload. OpenSSH targets use SFTP; AccessClient targets reuse the persistent shared shell. Restricted targets require an approved localRoot and relative localPath. Full-access targets may omit localRoot and use a gateway-local absolute localPath; remotePath must be a legal target-native absolute path. Transfer timeout is independent from command timeout: omit timeoutMs to use maxTransferTimeoutMs, or supply a value no greater than it. expectedSha256 accepts uppercase or lowercase hexadecimal.",
       inputSchema: uploadParamsSchema,
       outputSchema: taskStartResultSchema,
       annotations: {
@@ -345,7 +345,7 @@ export function createMcpServer(
     "ssh_download",
     {
       description:
-        "Start an SFTP download. Restricted targets require an approved localRoot and a relative localPath. Full-access targets may omit localRoot and use a gateway-local absolute localPath; remotePath must be a legal target-native absolute path. expectedSha256 accepts uppercase or lowercase hexadecimal.",
+        "Start a file download. OpenSSH targets use SFTP; AccessClient targets reuse the persistent shared shell. Restricted targets require an approved localRoot and relative localPath. Full-access targets may omit localRoot and use a gateway-local absolute localPath; remotePath must be a legal target-native absolute path. Transfer timeout is independent from command timeout: omit timeoutMs to use maxTransferTimeoutMs, or supply a value no greater than it. expectedSha256 accepts uppercase or lowercase hexadecimal.",
       inputSchema: downloadParamsSchema,
       outputSchema: taskStartResultSchema,
       annotations: {
@@ -367,7 +367,7 @@ export function createMcpServer(
     "ssh_sync",
     {
       description:
-        "Start a non-destructive one-way local-to-remote directory sync. Restricted targets require an approved localRoot and a relative localPath. Full-access targets may omit localRoot and use a gateway-local absolute localPath. Supports exclusions and dryRun.",
+        "Start a non-destructive one-way local-to-remote directory sync. OpenSSH targets use SFTP; AccessClient targets reuse the persistent shared shell. Restricted targets require an approved localRoot and relative localPath. Full-access targets may omit localRoot and use a gateway-local absolute localPath. Transfer timeout is independent from command timeout: omit timeoutMs to use maxTransferTimeoutMs, or supply a value no greater than it. Supports exclusions and dryRun.",
       inputSchema: syncParamsSchema,
       outputSchema: taskStartResultSchema,
       annotations: {

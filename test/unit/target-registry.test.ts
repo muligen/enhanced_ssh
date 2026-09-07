@@ -257,6 +257,45 @@ test("full-access authorizes every transfer direction and optional rooted compat
   );
 });
 
+test("AccessClient full-access exposes unrestricted bidirectional transfer", () => {
+  const targets = new TargetRegistry({
+    shared: {
+      sshAlias: "accessclient-internal",
+      connection: {
+        mode: "accessclient-share",
+        gatewayHost: "gateway.example.test",
+        gatewayPort: 22,
+        gatewayUsername: "portal-user",
+        expectedHostname: "target-host",
+      },
+      platform: "linux",
+      enabled: true,
+      policy: { mode: "full-access", maxTimeoutMs: 60_000 },
+    },
+  });
+
+  const summary = targets.list()[0]!;
+  assert.equal(summary.connectionMode, "accessclient-share");
+  assert.equal(summary.transferMode, "bidirectional");
+  assert.equal(summary.transferScope, "all");
+  assert.equal(summary.maxTimeoutMs, 60_000);
+  assert.equal(summary.maxTransferTimeoutMs, 3_600_000);
+  for (const direction of ["upload", "download", "sync"] as const) {
+    const authorization = targets.authorizeTransfer(
+      "shared",
+      direction,
+      undefined,
+      3_600_000,
+    );
+    assert.equal(authorization.scope, "all");
+    assert.equal(authorization.timeoutMs, 3_600_000);
+  }
+  assert.throws(
+    () => targets.authorize("shared", "hostname", 60_001),
+    hasGatewayCode(GATEWAY_ERROR_CODES.invalidParams),
+  );
+});
+
 test("structured execution is restricted to full-access targets", () => {
   const targets = registry();
 

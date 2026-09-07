@@ -55,9 +55,7 @@ const fragmentToken = fragment.get("token") ?? "";
 let sessionToken = SESSION_TOKEN_PATTERN.test(fragmentToken)
   ? fragmentToken
   : readStoredSessionToken();
-if (SESSION_TOKEN_PATTERN.test(fragmentToken)) {
-  storeSessionToken(fragmentToken);
-} else if (fragmentToken.length > 0) {
+if (fragmentToken.length > 0 && !SESSION_TOKEN_PATTERN.test(fragmentToken)) {
   clearSessionToken();
 }
 if (window.location.hash.length > 0) {
@@ -70,14 +68,6 @@ function readStoredSessionToken() {
     return SESSION_TOKEN_PATTERN.test(value) ? value : "";
   } catch {
     return "";
-  }
-}
-
-function storeSessionToken(value) {
-  try {
-    window.sessionStorage.setItem(SESSION_TOKEN_STORAGE_KEY, value);
-  } catch {
-    // A blocked session store still permits the initial fragment-authenticated page.
   }
 }
 
@@ -325,14 +315,12 @@ function createOutputPageState() {
 }
 
 async function postApi(route, body) {
-  if (!sessionToken) {
-    throw new ApiError(403, "INVALID_SESSION", "管理会话无效，请从服务输出的管理地址重新打开页面。");
-  }
   const response = await fetch(`/api/${route}`, {
     method: "POST",
+    credentials: "same-origin",
     headers: {
       "Content-Type": "application/json",
-      "X-Agent-SSH-UI-Token": sessionToken,
+      ...(sessionToken ? { "X-Agent-SSH-UI-Token": sessionToken } : {}),
     },
     body: JSON.stringify(body),
   });
@@ -354,6 +342,7 @@ async function postApi(route, body) {
     }
     throw error;
   }
+  clearSessionToken(); // Subsequent requests use the server-issued HttpOnly cookie.
   return payload;
 }
 
@@ -439,9 +428,15 @@ async function refreshApplication(options = {}) {
       renderUnavailableWorkspace();
     }
     const invalidSession = error instanceof ApiError && error.code === "INVALID_SESSION";
+    if (invalidSession && !retainedInventory) {
+      elements.workspaceTitle.textContent = "首次使用，请授权此浏览器";
+      elements.workspaceSubtitle.textContent = "通过本机管理入口打开一次后，即可直接访问固定地址；授权保留 30 天并随使用续期。";
+      elements.selectedStateBadge.textContent = "待授权";
+      elements.revisionLabel.textContent = "授权后读取";
+    }
     setGatewayState(
       "offline",
-      invalidSession ? "管理会话已失效" : "机器配置加载失败",
+       invalidSession ? "需要授权此浏览器" : "机器配置加载失败",
       retainedInventory ? `${state.targets.size} 台机器保留上次加载结果` : "未能读取机器配置",
     );
     showAlert(elements.inventoryError, messageForError(error), "error");
@@ -549,9 +544,7 @@ function normaliseFleetTarget(value) {
       ? value.allowedCommands.filter((command) => typeof command === "string")
       : [],
     maxTimeoutMs: validInteger(value.maxTimeoutMs, 1, MAX_TIMEOUT_MS) ? value.maxTimeoutMs : 30_000,
-    transferMode: connectionMode === "accessclient-share"
-      ? "deny"
-      : policyMode === "full-access"
+    transferMode: policyMode === "full-access"
         ? "bidirectional"
       : policyMode === "deny"
         ? "deny"
@@ -1206,9 +1199,7 @@ function renderPermissionFields() {
   const policyMode = selectedRadio(elements.policyInputs) ?? "allow-list";
   const selectedTransferMode = selectedRadio(elements.transferInputs) ?? "deny";
   const accessClient = selectedRadio(elements.connectionModeInputs) === "accessclient-share";
-  const transferMode = accessClient
-    ? "deny"
-    : policyMode === "full-access"
+  const transferMode = policyMode === "full-access"
       ? "bidirectional"
     : policyMode === "deny"
       ? "deny"
@@ -1225,15 +1216,11 @@ function renderPermissionFields() {
   elements.restrictedTransferSummary.textContent = TRANSFER_LABELS[transferMode];
   elements.policySummary.className = `policy-chip ${policyClass(policyMode)}`;
   elements.policySummary.textContent = POLICY_LABELS[policyMode];
-  elements.fullAccessHeading.textContent = accessClient
-    ? "Full access 将开放完整命令权限"
-    : "Full access 将开放完整命令与文件权限";
+  elements.fullAccessHeading.textContent = "Full access 将开放完整命令与文件权限";
   elements.fullAccessDescription.textContent = accessClient
-    ? "Codex 可以在目标账号权限内执行任意命令，包括修改配置、停止服务或删除数据。AccessClient 共享模式下文件传输仍保持关闭，每次保存都必须重新确认。"
+    ? "Codex 可以执行任意命令，并通过持久化 Plink 通道使用任意本机或远端绝对路径双向传输文件。每次保存都必须重新确认。"
     : "Codex 可以执行任意命令，并可使用任意本机或远端绝对路径双向传输文件，包括读取本机私钥、凭证等敏感文件，以及修改配置、停止服务或删除数据。每次保存都必须重新确认。";
-  elements.fullAccessConfirmText.textContent = accessClient
-    ? "我已核对目标机器，并确认授予 Codex 完整命令权限。"
-    : "我已核对目标机器，并确认授予 Codex 完整命令权限和全部本机、远端文件权限。";
+  elements.fullAccessConfirmText.textContent = "我已核对目标机器，并确认授予 Codex 完整命令权限和全部本机、远端文件权限。";
 }
 
 function setActiveOperation(operation, moveFocus = false) {
@@ -3380,7 +3367,7 @@ function messageForError(error) {
     return "请求失败，请检查本机管理服务。";
   }
   const messages = {
-    INVALID_SESSION: "管理会话已失效，请从服务输出的管理地址重新打开页面。",
+    INVALID_SESSION: "此浏览器尚未授权或授权已过期。请通过本机管理入口（ssh_open_admin）或服务输出的完整管理链接授权一次；之后直接打开固定地址即可。机器配置仍保存在本机。",
     INVALID_REQUEST: "请求参数无效，请检查填写内容。",
     CONFIG_BUSY: "网关正在执行命令或处理其他配置，请稍后重试。",
     CONFIG_INVALID: "网关配置无效，请检查机器、连接方式和凭据设置。",

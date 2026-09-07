@@ -269,6 +269,7 @@ class DemoGatewaySession implements TestUiGatewaySession {
           transferScope: "restricted",
           transferRoots: [],
           maxTimeoutMs: 30_000,
+          maxTransferTimeoutMs: 30_000,
         },
         {
           targetId: "t-00000000000000000000000000000002",
@@ -282,6 +283,7 @@ class DemoGatewaySession implements TestUiGatewaySession {
           transferScope: "restricted",
           transferRoots: [],
           maxTimeoutMs: 10_000,
+          maxTransferTimeoutMs: 10_000,
         },
       ],
     });

@@ -129,17 +129,17 @@ interface ClientHarness {
   settle(): Promise<void>;
 }
 
-test("management UI restores its fragment token after a same-tab reload", async () => {
+test("management UI exchanges its fragment token and attempts cookie authentication on a new page", async () => {
   const storage = new MemoryStorage();
   storage.setItem("agent-ssh-ui-token", "O".repeat(43));
   const first = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage });
 
-  assert.equal(storage.getItem("agent-ssh-ui-token"), SESSION_TOKEN);
+  assert.equal(storage.getItem("agent-ssh-ui-token"), null);
   assert.deepEqual(new Set(first.requestTokens), new Set([SESSION_TOKEN]));
   assert.equal(requireElement(first, "machine-count").textContent, "1");
 
-  const reloaded = await startClient({ hash: "", storage });
-  assert.deepEqual(new Set(reloaded.requestTokens), new Set([SESSION_TOKEN]));
+  const reloaded = await startClient({ hash: "", storage: new MemoryStorage() });
+  assert.deepEqual(new Set(reloaded.requestTokens), new Set([""]));
   assert.equal(requireElement(reloaded, "machine-count").textContent, "1");
   assert.equal(requireElement(reloaded, "inventory-empty").hidden, true);
 });
@@ -259,8 +259,8 @@ test("an invalid session clears the stored token without erasing loaded machines
   assert.equal(harness.storage.getItem("agent-ssh-ui-token"), null);
   assert.equal(requireElement(harness, "machine-count").textContent, "1");
   assert.equal(requireElement(harness, "machine-list").hidden, false);
-  assert.match(requireElement(harness, "inventory-error").textContent, /管理会话已失效/u);
-  assert.equal(requireElement(harness, "gateway-label").textContent, "管理会话已失效");
+  assert.match(requireElement(harness, "inventory-error").textContent, /授权已过期/u);
+  assert.equal(requireElement(harness, "gateway-label").textContent, "需要授权此浏览器");
   assert.equal(requireElement(harness, "new-machine-button").disabled, true);
 });
 
