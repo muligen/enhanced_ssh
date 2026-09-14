@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import type { GatewayErrorCode } from "./errors.js";
 
-export const PROTOCOL_VERSION = 7 as const;
+export const PROTOCOL_VERSION = 8 as const;
 export const MAX_RPC_FRAME_BYTES = 1_048_576;
 export const MAX_COMMAND_BYTES = 65_536;
 export const MAX_TIMEOUT_MS = 3_600_000;
@@ -39,6 +39,7 @@ export type TargetPlatform = z.infer<typeof targetPlatformSchema>;
 export const targetConnectionModeSchema = z.enum([
   "openssh",
   "accessclient-share",
+  "tailscale-ssh",
 ]);
 export type TargetConnectionMode = z.infer<
   typeof targetConnectionModeSchema
@@ -244,6 +245,9 @@ export const targetCheckFailureReasonSchema = z.enum([
   "accessclient-session-timeout",
   "accessclient-host-mismatch",
   "accessclient-session-ended",
+  "tailscale-unavailable",
+  "tailscale-peer-unavailable",
+  "tailscale-host-key-unavailable",
 ]);
 export type TargetCheckFailureReason = z.infer<
   typeof targetCheckFailureReasonSchema
@@ -289,7 +293,7 @@ export const targetCheckResultSchema = z
       context.addIssue({
         code: "custom",
         path: ["failureReason"],
-        message: "AccessClient failure reasons require exit code 255",
+        message: "Transport failure reasons require exit code 255",
       });
     }
   });

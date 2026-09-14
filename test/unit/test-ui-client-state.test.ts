@@ -110,7 +110,7 @@ class FakeElement {
 }
 
 type NetworkMode = "success" | "invalid-session" | "offline" | "config-error" | "config-error-with-keys" | "key-storage-error" | "key-file-unsafe" | "keys-error" | "orphan-key" | "pending" | "check-unavailable" | "check-host-mismatch" | "prepare-active";
-type ClientProfileKind = "openssh" | "accessclient" | "accessclient-unconfigured";
+type ClientProfileKind = "tailscale" | "openssh" | "accessclient" | "accessclient-unconfigured";
 
 interface ClientRequest {
   readonly url: string;
@@ -302,6 +302,7 @@ test("the OpenSSH first connection guide follows the selected key and platform",
   const expectedPublicKey = `ssh-ed25519 ${Buffer.from(KEY_ID).toString("base64")}`;
   const guide = requireElement(harness, "ssh-install-guide");
   const command = requireElement(harness, "ssh-install-command");
+  const launchButton = requireElement(harness, "launch-ssh-install-button");
   const copyButton = requireElement(harness, "copy-ssh-install-command-button");
 
   assert.equal(guide.hidden, false);
@@ -310,14 +311,27 @@ test("the OpenSSH first connection guide follows the selected key and platform",
   assert.match(command.textContent, /for \(i=1; i<NF; i\+\+\)/u);
   assert.ok(command.textContent.includes(expectedPublicKey));
   assert.ok(!command.textContent.includes(`${expectedPublicKey} test`));
+  assert.equal(launchButton.disabled, false);
   assert.equal(copyButton.disabled, false);
+
+  launchButton.dispatch("click");
+  await harness.settle();
+  const installRequest = harness.requests.find((candidate) =>
+    candidate.url.endsWith("/api/admin/ssh/install"),
+  );
+  assert.equal(
+    (installRequest?.body as { readonly target?: { readonly target?: { readonly keyId?: unknown } } })
+      ?.target?.target?.keyId,
+    KEY_ID,
+  );
 
   const platforms = harness.inputGroups.get('input[name="platform"]')!;
   platforms[1]!.checked = false;
   platforms[0]!.checked = true;
   requireElement(harness, "machine-form").dispatch("change", platforms[0]);
 
-  assert.match(command.textContent, /Join-Path \$env:USERPROFILE/u);
+  assert.match(command.textContent, /Join-Path \$env:ProgramData/u);
+  assert.match(command.textContent, /administrators_authorized_keys/u);
   assert.doesNotMatch(command.textContent, /umask 077/u);
   assert.ok(command.textContent.includes(expectedPublicKey));
 
@@ -350,6 +364,7 @@ test("the first connection guide updates its key and hides outside usable OpenSS
   requireElement(harness, "machine-form").dispatch("change", connectionModes[1]);
   assert.equal(requireElement(harness, "ssh-install-guide").hidden, true);
   assert.equal(requireElement(harness, "ssh-install-command").textContent, "");
+  assert.equal(requireElement(harness, "launch-ssh-install-button").disabled, true);
   assert.equal(requireElement(harness, "copy-ssh-install-command-button").disabled, true);
 });
 
@@ -362,6 +377,7 @@ test("the first connection guide stays unavailable for an orphaned key", async (
 
   assert.equal(requireElement(harness, "ssh-install-guide").hidden, true);
   assert.equal(requireElement(harness, "ssh-install-command").textContent, "");
+  assert.equal(requireElement(harness, "launch-ssh-install-button").disabled, true);
   assert.equal(requireElement(harness, "copy-ssh-install-command-button").disabled, true);
 });
 
@@ -1148,7 +1164,7 @@ function createInputGroups(): Map<string, FakeElement[]> {
   };
   return new Map([
     ['input[name="platform"]', [input("windows"), input("linux", true), input("macos")]],
-    ['input[name="connection-mode"]', [input("openssh", true), input("accessclient-share")]],
+    ['input[name="connection-mode"]', [input("openssh", true), input("accessclient-share"), input("tailscale-ssh")]],
     ['input[name="policy-mode"]', [input("allow-list", true), input("full-access"), input("deny")]],
     ['input[name="transfer-mode"]', [input("deny", true), input("upload"), input("download"), input("bidirectional")]],
     [".operation-tab", [operation("exec"), operation("transfer"), operation("inspect")]],
@@ -1220,6 +1236,11 @@ function fleetProfile(
   plinkExecutable = "",
   description?: string,
 ): unknown {
+  if (kind === "tailscale") {
+    return { version: 3, tailscale: { executable: "C:\\Program Files\\Tailscale\\tailscale.exe" }, targets: { alpha: {
+      enabled: true, connectionMode: "tailscale-ssh", target: { host: "build", port: 22, username: "ubuntu" }, platform: "linux", policyMode: "allow-list", allowedCommands: ["hostname"], maxTimeoutMs: 30000, transferMode: "deny",
+    } } };
+  }
   if (kind !== "openssh") {
     return {
       version: 3,
@@ -1276,3 +1297,24 @@ function requireElement(harness: ClientHarness, id: string): FakeElement {
   assert.notEqual(element, undefined, `missing fake element #${id}`);
   return element!;
 }
+
+
+test("Tailscale UI needs no private key and submits a credential-free command-only target", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, profile: "tailscale", mode: "keys-error", storage: new MemoryStorage() });
+  assert.equal(requireElement(harness, "tailscale-connection-note").hidden, false);
+  assert.equal(requireElement(harness, "target-key-field").hidden, true);
+  assert.equal(requireElement(harness, "known-hosts-field").hidden, true);
+  assert.equal(requireElement(harness, "target-port-field").hidden, true);
+  assert.equal(requireElement(harness, "save-button").disabled, false);
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const request = harness.requests.find((candidate) => candidate.url.endsWith("/api/admin/target/save"));
+  assert.ok(request);
+  const body = request.body as { target: { connectionMode: string; target: Record<string, unknown>; knownHostsFile?: string; accessClient?: unknown; transferMode: string } };
+  assert.equal(body.target.connectionMode, "tailscale-ssh");
+  assert.equal(body.target.target.port, 22);
+  assert.equal(body.target.target.keyId, undefined);
+  assert.equal(body.target.knownHostsFile, undefined);
+  assert.equal(body.target.accessClient, undefined);
+  assert.equal(body.target.transferMode, "deny");
+});

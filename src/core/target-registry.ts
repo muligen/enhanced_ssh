@@ -66,7 +66,7 @@ function compareAliases(left: string, right: string): number {
 
 function createEntry(alias: string, config: RegistryTargetConfig): RegistryEntry {
   const unrestrictedTransfer =
-    config.policy.mode === "full-access";
+    config.policy.mode === "full-access" && config.connection?.mode !== "tailscale-ssh";
   const target: RegisteredTarget = Object.freeze({
     targetId: config.targetId ?? legacyTargetId(alias, config.sshAlias),
     alias,
@@ -77,11 +77,9 @@ function createEntry(alias: string, config: RegistryTargetConfig): RegistryEntry
     enabled: config.enabled,
     platform: config.platform,
     connectionMode:
-      config.connection?.mode === "accessclient-share"
-        ? "accessclient-share"
-        : "openssh",
+      config.connection?.mode ?? "openssh",
     policyMode: config.policy.mode,
-    transferMode: unrestrictedTransfer
+    transferMode: config.connection?.mode === "tailscale-ssh" ? "deny" : unrestrictedTransfer
       ? "bidirectional"
       : (config.transfer?.mode ?? "deny"),
     transferScope: unrestrictedTransfer ? "all" : "restricted",
@@ -305,6 +303,9 @@ export class TargetRegistry {
     requestedTimeoutMs?: number,
   ): TransferAuthorization {
     const target = this.require(alias);
+    if (target.connectionMode === "tailscale-ssh") {
+      throw new GatewayError(GATEWAY_ERROR_CODES.transferDenied, "Tailscale SSH file transfer is not supported yet");
+    }
     const entry = this.#entries.get(target.alias);
     const transfer = entry?.transfer;
     const unrestricted = target.transferScope === "all";

@@ -1,4 +1,5 @@
 import { isUtf8 } from "node:buffer";
+import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
@@ -44,6 +45,7 @@ import {
   createManagedTargetId,
   currentManagedSshProfileSchema,
   managedAccessClientSettingsSchema,
+  managedTailscaleSettingsSchema,
   managedFleetTargetSchema,
   managedSshKeyIdSchema,
   managedSshKeyGenerationAlgorithmSchema,
@@ -158,6 +160,7 @@ const adminTargetEnabledRequestSchema = z.strictObject({
   enabled: z.boolean(),
   expectedRevision: managedRevisionSchema,
 });
+const adminTailscaleSaveRequestSchema = managedTailscaleSettingsSchema.extend({ expectedRevision: managedRevisionSchema.optional() });
 const adminAccessClientSaveRequestSchema = z.strictObject({
   plinkExecutable: managedAccessClientSettingsSchema.shape.plinkExecutable,
   expectedRevision: managedRevisionSchema.optional(),
@@ -192,6 +195,32 @@ const adminKeyRemoveRequestSchema = z.strictObject({
   keyId: managedSshKeyIdSchema,
   expectedKeyRevision: managedSshKeyRevisionSchema,
 });
+const adminSshInstallRequestSchema = z
+  .strictObject({ target: managedFleetTargetSchema })
+  .superRefine((request, context) => {
+    const target = request.target;
+    if ((target.connectionMode ?? "openssh") !== "openssh") {
+      context.addIssue({
+        code: "custom",
+        path: ["target", "connectionMode"],
+        message: "automatic SSH key installation requires OpenSSH",
+      });
+    }
+    if (target.target.keyId === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["target", "target", "keyId"],
+        message: "an OpenSSH private key is required",
+      });
+    }
+    if (target.knownHostsFile === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["target", "knownHostsFile"],
+        message: "a known_hosts path is required",
+      });
+    }
+  });
 
 interface ResultReference {
   readonly outputRef: string;
@@ -291,6 +320,7 @@ export async function startTestUiServer(
       response.statusCode = 200;
       response.setHeader("Content-Type", staticAsset.contentType);
       response.setHeader("Content-Length", staticAsset.body.length);
+      response.setHeader("Cache-Control", "no-store");
       response.end(staticAsset.body);
       return;
     }
@@ -706,6 +736,71 @@ export async function startTestUiServer(
         }
         return;
       }
+      case "/api/admin/ssh/install": {
+        const installRequest = adminSshInstallRequestSchema.parse(
+          await readJsonBody(request),
+        );
+        const configuration = requireFleetConfigurationService(options);
+        const target = installRequest.target;
+        const keyId = target.target.keyId!;
+        const status = await configuration.fleetStatus();
+        const key = status.keys.find((candidate) => candidate.keyId === keyId);
+        if (key === undefined) {
+          throw new HttpProblem(409, "KEY_NOT_FOUND", "The selected SSH key is unavailable");
+        }
+        launchInteractiveSshInstall({
+          host: target.target.host,
+          port: target.target.port,
+          username: target.target.username,
+          knownHostsFile: target.knownHostsFile!,
+          platform: target.platform,
+          publicKey: key.publicKey,
+        });
+        writeJson(response, 200, {
+          started: true,
+          platform: process.platform,
+        });
+        return;
+      }
+      case "/api/admin/tailscale/save": {
+        const tailscaleRequest = adminTailscaleSaveRequestSchema.parse(
+          await readJsonBody(request),
+        );
+        const configuration = requireFleetConfigurationService(options);
+        assertConfigurationMutationAvailable(
+          activeRun,
+          configurationMutationActive,
+          accessClientPreparationRequestActive ||
+            accessClientPreparationIsActive(options),
+        );
+        configurationMutationActive = true;
+        try {
+          const current = await configuration.fleetStatus();
+          assertExpectedRevision(
+            current.revision,
+            tailscaleRequest.expectedRevision,
+          );
+          const profile = managedSshFleetProfileSchema.parse({
+            version: 3,
+            ...(current.profile?.accessClient === undefined ? {} : { accessClient: current.profile.accessClient }),
+            tailscale: { executable: tailscaleRequest.executable },
+            targets: current.profile?.targets ?? {},
+          });
+          writeJson(
+            response,
+            200,
+            publicFleetStatus(
+              await configuration.applyFleet(
+                profile,
+                tailscaleRequest.expectedRevision,
+              ),
+            ),
+          );
+        } finally {
+          configurationMutationActive = false;
+        }
+        return;
+      }
       case "/api/admin/access-client/save": {
         const accessClientRequest = adminAccessClientSaveRequestSchema.parse(
           await readJsonBody(request),
@@ -726,6 +821,7 @@ export async function startTestUiServer(
           );
           const profile = managedSshFleetProfileSchema.parse({
             version: 3,
+            ...(current.profile?.tailscale === undefined ? {} : { tailscale: current.profile.tailscale }),
             accessClient: {
               plinkExecutable: accessClientRequest.plinkExecutable,
             },
@@ -956,6 +1052,7 @@ export async function startTestUiServer(
           };
           const profile = managedSshFleetProfileSchema.parse({
             version: 3,
+            ...(current.profile?.tailscale === undefined ? {} : { tailscale: current.profile.tailscale }),
             ...(current.profile?.accessClient === undefined
               ? {}
               : { accessClient: current.profile.accessClient }),
@@ -1002,6 +1099,7 @@ export async function startTestUiServer(
           delete targets[removeRequest.alias];
           const profile = managedSshFleetProfileSchema.parse({
             version: 3,
+            ...(current.profile?.tailscale === undefined ? {} : { tailscale: current.profile.tailscale }),
             ...(current.profile?.accessClient === undefined
               ? {}
               : { accessClient: current.profile.accessClient }),
@@ -1058,6 +1156,7 @@ export async function startTestUiServer(
           };
           const profile = managedSshFleetProfileSchema.parse({
             version: 3,
+            ...(current.profile?.tailscale === undefined ? {} : { tailscale: current.profile.tailscale }),
             ...(current.profile?.accessClient === undefined
               ? {}
               : { accessClient: current.profile.accessClient }),
@@ -1652,6 +1751,7 @@ async function learnAccessClientHostname(
   }
   const profile = managedSshFleetProfileSchema.parse({
     version: 3,
+    ...(current.profile?.tailscale === undefined ? {} : { tailscale: current.profile.tailscale }),
     ...(current.profile?.accessClient === undefined
       ? {}
       : { accessClient: current.profile.accessClient }),
@@ -1808,6 +1908,119 @@ function statusForGatewayCode(code: string | undefined): number {
     default:
       return 500;
   }
+}
+
+interface InteractiveSshInstallOptions {
+  readonly host: string;
+  readonly port: number;
+  readonly username: string;
+  readonly knownHostsFile: string;
+  readonly platform: "windows" | "linux" | "macos";
+  readonly publicKey: string;
+}
+
+function launchInteractiveSshInstall(
+  options: InteractiveSshInstallOptions,
+): void {
+  const remoteCommand = buildSshInstallRemoteCommand(
+    options.platform,
+    options.publicKey,
+  );
+  const sshArguments = [
+    "/usr/bin/ssh",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "PubkeyAuthentication=no",
+    "-o",
+    "PreferredAuthentications=password,keyboard-interactive",
+    "-o",
+    `UserKnownHostsFile=${options.knownHostsFile}`,
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-p",
+    String(options.port),
+    `${options.username}@${options.host}`,
+    remoteCommand,
+  ];
+
+  if (process.platform === "darwin") {
+    const command = sshArguments.map(shellQuotePosix).join(" ");
+    const appleScript = [
+      "tell application \"Terminal\"",
+      "activate",
+      `do script ${appleScriptQuote(command)}`,
+      "end tell",
+    ].join("\n");
+    const child = spawn("/usr/bin/osascript", ["-e", appleScript], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.once("error", () => undefined);
+    child.unref();
+    return;
+  }
+
+  if (process.platform === "win32") {
+    const command = [
+      "ssh.exe",
+      "-o",
+      "IdentitiesOnly=yes",
+      "-o",
+      "PubkeyAuthentication=no",
+      "-o",
+      "PreferredAuthentications=password,keyboard-interactive",
+      "-o",
+      `UserKnownHostsFile=${options.knownHostsFile}`,
+      "-o",
+      "StrictHostKeyChecking=yes",
+      "-p",
+      String(options.port),
+      `${options.username}@${options.host}`,
+      remoteCommand,
+    ].map(shellQuotePowerShell).join(" ");
+    const child = spawn(
+      process.env.ComSpec ?? "cmd.exe",
+      ["/d", "/c", "start", "\"SSH 公钥安装\"", "powershell.exe", "-NoLogo", "-NoExit", "-Command", command],
+      { detached: true, stdio: "ignore", windowsHide: false },
+    );
+    child.once("error", () => undefined);
+    child.unref();
+    return;
+  }
+
+  const command = sshArguments.map(shellQuotePosix).join(" ");
+  const child = spawn(
+    "x-terminal-emulator",
+    ["-e", "sh", "-lc", `${command}; printf '\\nSSH 公钥安装命令已结束，按回车关闭。'; read -r`],
+    { detached: true, stdio: "ignore" },
+  );
+  child.once("error", () => undefined);
+  child.unref();
+}
+
+function buildSshInstallRemoteCommand(
+  platform: InteractiveSshInstallOptions["platform"],
+  publicKey: string,
+): string {
+  if (platform === "windows") {
+    const script = `$k='${publicKey}';$utf8=[Text.UTF8Encoding]::new($false);$id=[Security.Principal.WindowsIdentity]::GetCurrent();$p=[Security.Principal.WindowsPrincipal]::new($id);if($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){$d=Join-Path $env:ProgramData 'ssh';$f=Join-Path $d 'administrators_authorized_keys'}else{$d=Join-Path $env:USERPROFILE '.ssh';$f=Join-Path $d 'authorized_keys'};[IO.Directory]::CreateDirectory($d)|Out-Null;if(!(Test-Path -LiteralPath $f)){[IO.File]::WriteAllText($f,'',$utf8)};$parts=$k -split ' ';$exists=[IO.File]::ReadAllLines($f)|Where-Object{$line=$_ -split '\\s+';for($i=0;$i-lt $line.Count-1;$i++){if($line[$i] -ceq $parts[0] -and $line[$i+1] -ceq $parts[1]){return $true}}return $false}|Select-Object -First 1;if(!$exists){[IO.File]::AppendAllText($f,[Environment]::NewLine+$k+[Environment]::NewLine,$utf8)};if($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){& icacls.exe $d /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F'|Out-Null;& icacls.exe $f /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F'|Out-Null}else{$sid=$id.User.Value;& icacls.exe $d /inheritance:r /grant:r \"*$($sid):(OI)(CI)F\" '*S-1-5-18:(OI)(CI)F'|Out-Null;& icacls.exe $f /inheritance:r /grant:r \"*$($sid):F\" '*S-1-5-18:F'|Out-Null};Write-Output 'SSH public key installed.'`;
+    return `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
+  }
+  const quotedKey = shellQuotePosix(publicKey);
+  return `umask 077; k=${quotedKey}; d="$HOME/.ssh"; f="$d/authorized_keys"; mkdir -p "$d" && chmod 700 "$d" && touch "$f" && chmod 600 "$f" && { awk -v k="$k" 'BEGIN { split(k,p," ") } { for (i=1; i<NF; i++) if ($i==p[1] && $(i+1)==p[2]) found=1 } END { exit found ? 0 : 1 }' "$f" || printf '\\n%s\\n' "$k" >> "$f"; }; printf 'SSH public key installed.\\n'`;
+}
+
+function shellQuotePosix(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function shellQuotePowerShell(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function appleScriptQuote(value: string): string {
+  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("\n", "\\n")}"`;
 }
 
 function writeProblem(response: ServerResponse, problem: HttpProblem): void {

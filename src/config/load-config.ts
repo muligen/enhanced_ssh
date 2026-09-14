@@ -130,6 +130,12 @@ export const accessClientShareConnectionSchema = z.strictObject({
   }
 });
 
+export const tailscaleSshConnectionSchema = z.strictObject({
+  mode: z.literal("tailscale-ssh"),
+  host: sshHostSchema,
+  username: z.string().min(1).max(128).regex(/^[A-Za-z_][A-Za-z0-9._-]*[$]?$/u),
+});
+
 const allowedCommandSchema = z
   .string()
   .min(1)
@@ -244,7 +250,7 @@ export const targetConfigSchema = z.strictObject({
     )
     .optional(),
   sshAlias: targetAliasSchema,
-  connection: accessClientShareConnectionSchema.optional(),
+  connection: z.union([accessClientShareConnectionSchema, tailscaleSshConnectionSchema]).optional(),
   platform: targetPlatformSchema.default("linux"),
   enabled: z.boolean(),
   policy: targetPolicySchema,
@@ -390,6 +396,7 @@ export const gatewayConfigSchema = z
       knownHostsFile: openSshConfigurationPathSchema,
       connectTimeoutSeconds: z.number().int().min(1).max(120),
     }),
+    tailscale: z.strictObject({ executable: absolutePathSchema }).optional(),
     putty: z
       .strictObject({
         executable: absolutePathSchema,
@@ -437,6 +444,11 @@ export const gatewayConfigSchema = z
       });
     }
     for (const [alias, target] of Object.entries(config.targets)) {
+      if (target.connection?.mode === "tailscale-ssh") {
+        if (config.tailscale === undefined || target.platform === "windows" || target.transfer.mode !== "deny") {
+          context.addIssue({ code: "custom", path: ["targets", alias, "connection"], message: "Tailscale SSH requires tailscale.executable, a Linux/macOS target, and disabled file transfer" });
+        }
+      }
       if (target.connection?.mode === "accessclient-share" && config.putty === undefined) {
         context.addIssue({
           code: "custom",

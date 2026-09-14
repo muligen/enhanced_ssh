@@ -19,6 +19,7 @@
           <p>Agent SSH Gateway</p>
         </div>
       </div>
+      <span class="environment-label"><span aria-hidden="true">◉</span> 本地工作空间</span>
       <div class="gateway-state" aria-live="polite">
         <span id="gateway-dot" class="status-dot is-checking" aria-hidden="true"></span>
         <div class="gateway-state-copy">
@@ -33,18 +34,28 @@
       <aside class="inventory" aria-labelledby="inventory-heading">
         <div class="inventory-header">
           <div>
-            <p class="eyebrow">机器库存</p>
+            <p class="eyebrow">WORKSPACE</p>
             <h2 id="inventory-heading">SSH 机器 <span id="machine-count" class="count-badge">--</span></h2>
           </div>
           <button id="new-machine-button" class="secondary-button compact-button" type="button" disabled>
             <span aria-hidden="true">+</span><span>新增</span>
           </button>
         </div>
+        <div class="inventory-search">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg>
+          <input id="machine-search" type="search" aria-label="搜索机器" placeholder="搜索名称、地址或说明" autocomplete="off">
+        </div>
+        <div id="inventory-no-results" class="inventory-no-results" role="status" hidden>没有匹配的机器，试试其他关键词。</div>
         <div id="inventory-error" class="inline-alert is-error" role="alert" hidden></div>
         <div id="machine-list" class="machine-list" role="list" aria-label="已配置的 SSH 机器" hidden></div>
         <div id="inventory-empty" class="inventory-empty" hidden>
-          <strong>还没有机器</strong>
-          <p>新增一台机器，配置真实 SSH 地址与私钥。</p>
+          <svg class="empty-server-icon" aria-hidden="true" viewBox="0 0 48 48"><rect x="8" y="8" width="32" height="13" rx="3"/><rect x="8" y="27" width="32" height="13" rx="3"/><path d="M14 14.5h1m5 0h13M14 33.5h1m5 0h13M24 21v6"/></svg>
+          <strong>从第一台机器开始</strong>
+          <p>添加服务器后，在这里集中管理连接与访问权限。</p>
+        </div>
+        <div class="inventory-guide">
+          <span class="eyebrow">开始使用</span>
+          <ol><li>在全局设置中准备私钥</li><li>添加机器与访问权限</li><li>保存配置并检测连接</li></ol>
         </div>
         <div class="inventory-footer">
           <span>配置版本</span>
@@ -55,6 +66,7 @@
       <section class="workspace" aria-labelledby="workspace-title">
         <div class="workspace-header">
           <div class="workspace-title-wrap">
+            <div class="breadcrumb">工作空间 <span aria-hidden="true">/</span> <span id="breadcrumb-current">机器管理</span></div>
             <div class="machine-heading-line">
               <h2 id="workspace-title">正在加载机器配置</h2>
               <span id="selected-state-badge" class="state-badge is-draft">加载中</span>
@@ -65,18 +77,23 @@
         </div>
 
         <div class="workspace-tabs" role="tablist" aria-label="机器管理视图">
-          <button id="config-tab" class="workspace-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="config-panel" tabindex="0">机器配置</button>
-          <button id="command-tab" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="command-panel" tabindex="-1" disabled>命令执行</button>
-          <button id="settings-tab" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-panel" tabindex="-1">全局设置</button>
+          <button id="config-tab" class="workspace-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="config-panel" tabindex="0"><span class="tab-icon" aria-hidden="true">▤</span>机器配置</button>
+          <button id="command-tab" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="command-panel" tabindex="-1" disabled><span class="tab-icon tab-terminal" aria-hidden="true">&gt;_</span>命令执行</button>
+          <button id="settings-tab" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-panel" tabindex="-1"><span class="tab-icon" aria-hidden="true">⚙</span>全局设置</button>
         </div>
 
         <div id="config-panel" class="tab-panel" role="tabpanel" aria-labelledby="config-tab">
           <form id="machine-form" novalidate hidden>
+            <nav class="section-navigation" aria-label="配置分区">
+              <a href="#identity-heading"><span>01</span>机器标识</a>
+              <a href="#connection-heading"><span>02</span>SSH 连接</a>
+              <a href="#permission-heading"><span>03</span>权限管理</a>
+            </nav>
             <section class="form-section" aria-labelledby="identity-heading">
               <div class="section-heading">
                 <div>
                   <p class="section-index">01</p>
-                  <h3 id="identity-heading">机器标识</h3>
+                  <h3 id="identity-heading" tabindex="-1">机器标识</h3><p class="section-description">设置易于识别的名称与远端操作系统。</p>
                 </div>
               </div>
 
@@ -107,15 +124,16 @@
               <div class="section-heading">
                 <div>
                   <p class="section-index">02</p>
-                  <h3 id="connection-heading">SSH 连接</h3>
+                  <h3 id="connection-heading" tabindex="-1">SSH 连接</h3><p class="section-description">选择连接方式，配置服务器与身份凭据。</p>
                 </div>
               </div>
 
               <fieldset class="field-group connection-mode-field">
                 <legend>连接方式</legend>
-                <div id="connection-mode-control" class="segmented-control two-segments">
+                <div id="connection-mode-control" class="segmented-control three-segments">
                   <label><input type="radio" name="connection-mode" value="openssh" checked><span>OpenSSH 私钥</span></label>
                   <label><input type="radio" name="connection-mode" value="accessclient-share"><span>AccessClient 已登录会话</span></label>
+                  <label><input type="radio" name="connection-mode" value="tailscale-ssh"><span>Tailscale SSH</span></label>
                 </div>
               </fieldset>
 
@@ -126,7 +144,7 @@
 
               <div id="openssh-connection-fields">
                 <div class="field-grid openssh-endpoint-grid">
-                  <div class="field narrow-field">
+                  <div id="target-port-field" class="field narrow-field">
                     <label for="target-port">SSH 端口</label>
                     <input id="target-port" name="target-port" type="number" value="22" min="1" max="65535" step="1" inputmode="numeric" required>
                   </div>
@@ -136,7 +154,7 @@
                   </div>
                 </div>
 
-                <div class="field key-select-field">
+                <div id="target-key-field" class="field key-select-field">
                   <label for="target-key-id">私钥</label>
                   <select id="target-key-id" name="target-key-id" required>
                     <option value="">正在加载私钥...</option>
@@ -149,16 +167,25 @@
 
                 <div id="ssh-install-guide" class="ssh-install-guide" hidden>
                   <div class="ssh-install-guide-header">
-                    <p class="field-note">首次连接：先用密码登录服务器，再把下方命令复制到远端终端执行，将所选私钥对应的公钥加入登录授权。</p>
+                    <p class="field-note">首次连接：自动启动终端并用密码登录服务器，把所选私钥对应的公钥加入登录授权。密码只在终端中输入，不会保存到网关。</p>
+                    <button id="launch-ssh-install-button" class="toolbar-button ssh-install-launch-button" type="button">自动启动安装</button>
                     <button id="copy-ssh-install-command-button" class="toolbar-button" type="button">复制命令</button>
                   </div>
                   <pre id="ssh-install-command" class="ssh-install-command" tabindex="0" aria-label="远端公钥安装命令"></pre>
                 </div>
 
-                <div class="field">
+                <div id="known-hosts-field" class="field">
                   <label for="known-hosts-file">known_hosts 路径</label>
                   <input id="known-hosts-file" class="path-input" name="known-hosts-file" type="text" maxlength="4096" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="已验证主机指纹文件的绝对路径" required>
                   <p id="known-hosts-note" class="field-note">必须使用本机绝对路径，网关会严格校验主机指纹。</p>
+                </div>
+              </div>
+
+              <div id="tailscale-connection-note" class="connection-status-line" hidden>
+                <span class="status-dot is-idle" aria-hidden="true"></span>
+                <div><strong>使用 Tailnet 身份授权 · SSH 端口 22</strong>
+                  <p>填写 Tailscale IP、MagicDNS 名称或完整域名，以及远端系统账号。本机需已登录 Tailscale；远端需启用 Tailscale SSH，且 tailnet 网络与 SSH 策略允许访问。</p>
+                  <p>如果策略要求 check 重新认证，请由管理员完成认证后重试。本连接方式暂不支持文件传输。</p>
                 </div>
               </div>
 
@@ -195,7 +222,7 @@
               <div class="section-heading">
                 <div>
                   <p class="section-index">03</p>
-                  <h3 id="permission-heading">权限管理</h3>
+                  <h3 id="permission-heading" tabindex="-1">权限管理</h3><p class="section-description">明确 Agent 可以执行的操作与访问范围。</p>
                 </div>
                 <span id="policy-summary" class="policy-chip is-allow">白名单</span>
               </div>
@@ -293,7 +320,8 @@
             <div id="form-status" class="inline-alert" role="status" aria-live="polite" hidden></div>
 
             <div class="form-actions">
-              <button id="delete-button" class="danger-text-button" type="button" hidden>删除机器</button>
+              <div class="action-context"><p id="action-hint" role="status">填写配置后保存，再检测连接。</p>
+              <button id="delete-button" class="danger-text-button" type="button" hidden>删除机器</button></div>
               <div class="primary-actions">
                 <button id="check-button" class="secondary-button" type="button">检测连接</button>
                 <button id="save-button" class="primary-button" type="submit">保存配置</button>
@@ -303,38 +331,6 @@
         </div>
 
         <div id="settings-panel" class="tab-panel settings-panel" role="tabpanel" aria-labelledby="settings-tab" hidden>
-          <section class="form-section" aria-labelledby="accessclient-settings-heading">
-            <div class="section-heading accessclient-settings-heading">
-              <div>
-                <p class="section-index">AccessClient</p>
-                <h3 id="accessclient-settings-heading">PuTTY 共享连接</h3>
-              </div>
-              <span id="accessclient-settings-badge" class="state-badge is-draft">未配置</span>
-            </div>
-
-            <div id="accessclient-settings-error" class="inline-alert is-error key-alert" role="alert" hidden></div>
-            <div id="accessclient-settings-status" class="inline-alert key-alert" role="status" aria-live="polite" hidden></div>
-
-            <form id="accessclient-settings-form" class="accessclient-settings-form" novalidate>
-              <div class="field">
-                <label for="plink-executable">Plink 程序路径</label>
-                <input id="plink-executable" class="path-input" name="plink-executable" type="text" maxlength="4096" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="例如 G:\PuTTY\plink.exe">
-                <p class="field-note">使用与 AccessClient PuTTY 兼容的 plink.exe；路径保存后可供所有 AccessClient 机器复用。</p>
-              </div>
-              <div class="accessclient-settings-actions">
-                <button id="save-accessclient-settings-button" class="primary-button" type="submit">保存 Plink 路径</button>
-              </div>
-            </form>
-
-            <div class="connection-status-line accessclient-session-note">
-              <span id="accessclient-settings-dot" class="status-dot is-idle" aria-hidden="true"></span>
-              <div>
-                <strong id="accessclient-settings-label">尚未配置 Plink</strong>
-                <p id="accessclient-settings-detail">先保存 Plink 路径，再到机器配置选择 AccessClient 会话并检测连接。</p>
-              </div>
-            </div>
-          </section>
-
           <section class="form-section" aria-labelledby="key-management-heading">
             <div class="section-heading key-management-heading">
               <div>
@@ -394,6 +390,70 @@
               <pre id="public-key-output" class="public-key-output" tabindex="0" aria-label="SSH 公钥"></pre>
               <p class="field-note">将公钥加入远端账号的 authorized_keys 后再检测连接。</p>
             </section>
+          </section>
+
+          <section class="form-section" aria-labelledby="accessclient-settings-heading">
+            <div class="section-heading accessclient-settings-heading">
+              <div>
+                <p class="section-index">AccessClient</p>
+                <h3 id="accessclient-settings-heading">PuTTY 共享连接</h3>
+              </div>
+              <span id="accessclient-settings-badge" class="state-badge is-draft">未配置</span>
+            </div>
+
+            <div id="accessclient-settings-error" class="inline-alert is-error key-alert" role="alert" hidden></div>
+            <div id="accessclient-settings-status" class="inline-alert key-alert" role="status" aria-live="polite" hidden></div>
+
+            <form id="accessclient-settings-form" class="accessclient-settings-form" novalidate>
+              <div class="field">
+                <label for="plink-executable">Plink 程序路径</label>
+                <input id="plink-executable" class="path-input" name="plink-executable" type="text" maxlength="4096" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="plink-executable-note" placeholder="例如 G:\PuTTY\plink.exe">
+              </div>
+              <div class="accessclient-settings-actions">
+                <button id="save-accessclient-settings-button" class="primary-button" type="submit">保存 Plink 路径</button>
+              </div>
+              <p id="plink-executable-note" class="field-note">使用与 AccessClient PuTTY 兼容的 plink.exe；路径保存后可供所有 AccessClient 机器复用。</p>
+            </form>
+
+            <div class="connection-status-line accessclient-session-note">
+              <span id="accessclient-settings-dot" class="status-dot is-idle" aria-hidden="true"></span>
+              <div>
+                <strong id="accessclient-settings-label">尚未配置 Plink</strong>
+                <p id="accessclient-settings-detail">先保存 Plink 路径，再到机器配置选择 AccessClient 会话并检测连接。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="form-section" aria-labelledby="tailscale-settings-heading">
+            <div class="section-heading tailscale-settings-heading">
+              <div>
+                <p class="section-index">Tailscale</p>
+                <h3 id="tailscale-settings-heading">Tailscale SSH</h3>
+              </div>
+              <span id="tailscale-settings-badge" class="state-badge is-draft">未配置</span>
+            </div>
+
+            <div id="tailscale-settings-error" class="inline-alert is-error key-alert" role="alert" hidden></div>
+            <div id="tailscale-settings-status" class="inline-alert key-alert" role="status" aria-live="polite" hidden></div>
+
+            <form id="tailscale-settings-form" class="accessclient-settings-form" novalidate>
+              <div class="field">
+                <label for="tailscale-executable">Tailscale 程序路径</label>
+                <input id="tailscale-executable" class="path-input" name="tailscale-executable" type="text" maxlength="4096" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="tailscale-executable-note" placeholder="例如 C:\Program Files\Tailscale\tailscale.exe">
+              </div>
+              <div class="accessclient-settings-actions">
+                <button id="save-tailscale-settings-button" class="primary-button" type="submit">保存 Tailscale 路径</button>
+              </div>
+              <p id="tailscale-executable-note" class="field-note">选择本机已安装的 tailscale.exe。请先在 Tailscale 客户端登录；Gateway 不保存登录密钥，也不修改 tailnet 策略。</p>
+            </form>
+
+            <div class="connection-status-line tailscale-session-note">
+              <span id="tailscale-settings-dot" class="status-dot is-idle" aria-hidden="true"></span>
+              <div>
+                <strong id="tailscale-settings-label">尚未配置 Tailscale</strong>
+                <p id="tailscale-settings-detail">保存路径后，在机器配置中选择 Tailscale SSH。连接可用性由“检测连接”确认。</p>
+              </div>
+            </div>
           </section>
         </div>
 

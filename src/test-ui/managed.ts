@@ -174,6 +174,10 @@ const managedAccessClientSessionSchema = z.strictObject({
   }
 });
 
+export const managedTailscaleSettingsSchema = z.strictObject({
+  executable: sshPathSchema,
+});
+
 export const managedAccessClientSettingsSchema = z.strictObject({
   plinkExecutable: sshPathSchema,
 });
@@ -269,7 +273,7 @@ const managedFleetCommonTargetFields = {
   description: managedDescriptionSchema.optional(),
   enabled: z.boolean(),
   connectionMode: z
-    .enum(["openssh", "accessclient-share"])
+    .enum(["openssh", "accessclient-share", "tailscale-ssh"])
     .optional(),
   knownHostsFile: sshPathSchema.optional(),
   accessClient: managedAccessClientSessionSchema.optional(),
@@ -360,6 +364,15 @@ export const managedFleetTargetSchema = z.discriminatedUnion("policyMode", [
         message: "AccessClient file transfer is not enabled",
       });
     }
+  } else if (connectionMode === "tailscale-ssh") {
+    for (const field of ["knownHostsFile", "bastion", "accessClient", "localRootPath", "maxTransferTimeoutMs"] as const) {
+      if (target[field] !== undefined) context.addIssue({ code: "custom", path: [field], message: "Tailscale SSH does not use this field" });
+    }
+    if (target.target.keyId !== undefined) context.addIssue({ code: "custom", path: ["target", "keyId"], message: "Tailscale SSH uses tailnet identity, not a private key" });
+    if (target.target.port !== 22) context.addIssue({ code: "custom", path: ["target", "port"], message: "Tailscale SSH uses port 22" });
+    if (!/^[A-Za-z_][A-Za-z0-9._-]*$/u.test(target.target.username)) context.addIssue({ code: "custom", path: ["target", "username"], message: "Tailscale SSH requires a simple remote account name" });
+    if (target.platform === "windows") context.addIssue({ code: "custom", path: ["platform"], message: "Tailscale SSH servers require Linux or macOS" });
+    if ((target.transferMode ?? "deny") !== "deny" || (target.remoteRoots ?? []).length !== 0) context.addIssue({ code: "custom", path: ["transferMode"], message: "Tailscale SSH file transfer is not supported yet" });
   } else {
     if (target.target.keyId === undefined) {
       context.addIssue({
@@ -579,8 +592,12 @@ function puttySharingIdentity(
 export const managedSshFleetProfileSchema = z.strictObject({
   version: z.literal(3),
   accessClient: managedAccessClientSettingsSchema.optional(),
+  tailscale: managedTailscaleSettingsSchema.optional(),
   targets: managedFleetTargetsSchema,
 }).superRefine((profile, context) => {
+  if (profile.tailscale === undefined && Object.values(profile.targets).some((target) => target.connectionMode === "tailscale-ssh")) {
+    context.addIssue({ code: "custom", path: ["tailscale"], message: "Tailscale SSH targets require global Tailscale settings" });
+  }
   if (
     profile.accessClient === undefined &&
     Object.values(profile.targets).some(
@@ -851,19 +868,26 @@ class ManagedSshService implements TestUiConfigurationService {
 
   public constructor(paths: ManagedPaths) {
     this.#paths = paths;
-    const systemRoot = process.env.SystemRoot ?? String.raw`C:\Windows`;
-    this.#sshExecutable = path.join(
-      systemRoot,
-      "System32",
-      "OpenSSH",
-      "ssh.exe",
-    );
-    this.#sshKeygenExecutable = path.join(
-      systemRoot,
-      "System32",
-      "OpenSSH",
-      "ssh-keygen.exe",
-    );
+    if (process.platform === "win32") {
+      const systemRoot = process.env.SystemRoot ?? String.raw`C:\Windows`;
+      this.#sshExecutable = path.join(
+        systemRoot,
+        "System32",
+        "OpenSSH",
+        "ssh.exe",
+      );
+      this.#sshKeygenExecutable = path.join(
+        systemRoot,
+        "System32",
+        "OpenSSH",
+        "ssh-keygen.exe",
+      );
+    } else {
+      // The managed gateway runtime is Windows-only, but the management UI
+      // also runs on macOS/Linux for preparing and validating configurations.
+      this.#sshExecutable = "/usr/bin/ssh";
+      this.#sshKeygenExecutable = "/usr/bin/ssh-keygen";
+    }
     this.#keyVault = new ManagedSshKeyVault(
       paths.keys,
       this.#sshKeygenExecutable,
@@ -1471,6 +1495,7 @@ class ManagedSshService implements TestUiConfigurationService {
     await Promise.all([
       assertTrustedExecutable(this.#sshExecutable, "ssh"),
       assertTrustedExecutable(this.#sshKeygenExecutable, "ssh-keygen"),
+      ...(profile.tailscale === undefined ? [] : [assertTrustedExecutable(profile.tailscale.executable, "tailscale")]),
       ...(profile.accessClient === undefined
         ? []
         : [
@@ -1492,7 +1517,7 @@ class ManagedSshService implements TestUiConfigurationService {
       await hardenPrivatePath(staging.credentialDirectory, true);
       const entries = sortedFleetEntries(profile);
       for (const [alias, target] of entries) {
-        if (isAccessClientManagedTarget(target)) continue;
+        if (usesExternalIdentity(target)) continue;
         const credentials = fleetCredentialPaths(staging, alias);
         await mkdir(credentials.root, { mode: 0o700 });
         await hardenPrivatePath(credentials.root, true);
@@ -1500,7 +1525,7 @@ class ManagedSshService implements TestUiConfigurationService {
 
       await allSettledOrThrow(
         entries.flatMap(([alias, target]) => {
-          if (isAccessClientManagedTarget(target)) return [];
+          if (usesExternalIdentity(target)) return [];
           const credentials = fleetCredentialPaths(staging, alias);
           return [
             importPrivateFile(
@@ -1531,7 +1556,7 @@ class ManagedSshService implements TestUiConfigurationService {
 
       await allSettledOrThrow(
         entries.flatMap(([alias, target]) => {
-          if (isAccessClientManagedTarget(target)) return [];
+          if (usesExternalIdentity(target)) return [];
           const credentials = fleetCredentialPaths(staging, alias);
           return [
             validatePrivateKey(
@@ -1568,7 +1593,7 @@ class ManagedSshService implements TestUiConfigurationService {
       await writeAggregateKnownHosts(
         staging,
         entries
-          .filter(([, target]) => !isAccessClientManagedTarget(target))
+          .filter(([, target]) => !usesExternalIdentity(target))
           .map(([alias]) => alias),
       );
       await validateFleetCredentials(
@@ -2085,6 +2110,10 @@ function isAccessClientManagedTarget(
   );
 }
 
+function usesExternalIdentity(target: ManagedSshFleetTarget | StoredManagedSshFleetTargetV2): boolean {
+  return target.connectionMode === "accessclient-share" || target.connectionMode === "tailscale-ssh";
+}
+
 function fleetSshAliases(index: number): {
   readonly target: string;
   readonly bastion: string;
@@ -2110,7 +2139,7 @@ function managedKeyReferences(
   const references = new Map<string, ManagedSshKeyReference[]>();
   if (profile === undefined) return references;
   for (const [alias, target] of sortedFleetEntries(profile)) {
-    if (isAccessClientManagedTarget(target)) continue;
+    if (usesExternalIdentity(target)) continue;
     const targetReference: ManagedSshKeyReference = {
       alias,
       ...(target.targetId === undefined ? {} : { targetId: target.targetId }),
@@ -2193,6 +2222,7 @@ function ensureFleetTargetIdentities(
     ...(profile.accessClient === undefined
       ? {}
       : { accessClient: profile.accessClient }),
+    ...(profile.tailscale === undefined ? {} : { tailscale: profile.tailscale }),
     targets,
   });
 }
@@ -2397,7 +2427,7 @@ function normaliseFleetCredentialPaths(
 ): ManagedSshFleetProfile {
   const targets: Record<string, unknown> = {};
   for (const [alias, target] of sortedFleetEntries(profile)) {
-    if (isAccessClientManagedTarget(target)) {
+    if (usesExternalIdentity(target)) {
       targets[alias] = { ...target };
       continue;
     }
@@ -2412,6 +2442,7 @@ function normaliseFleetCredentialPaths(
     ...(profile.accessClient === undefined
       ? {}
       : { accessClient: profile.accessClient }),
+    ...(profile.tailscale === undefined ? {} : { tailscale: profile.tailscale }),
     targets,
   });
 }
@@ -2486,7 +2517,7 @@ function compatibilityProfile(
   if (
     target === undefined ||
     target.policyMode === "deny" ||
-    isAccessClientManagedTarget(target) ||
+    usesExternalIdentity(target) ||
     revision === undefined
   ) {
     return undefined;
@@ -2530,7 +2561,7 @@ function renderManagedFleetOpenSshConfiguration(
     "# Generated by Agent SSH Gateway managed setup. Do not edit.",
   ];
   for (const [index, [alias, target]] of sortedStoredFleetEntries(profile).entries()) {
-    if (isAccessClientManagedTarget(target)) continue;
+    if (usesExternalIdentity(target)) continue;
     const credentials = fleetCredentialPaths(revision, alias);
     const sshAliases = fleetSshAliases(index);
     if (target.bastion !== undefined) {
@@ -2689,6 +2720,9 @@ function renderFleetGatewayConfiguration(
       sshAlias: sshAliases.target,
       enabled: target.enabled,
       platform: target.platform,
+      ...(target.connectionMode === "tailscale-ssh" ? {
+        connection: { mode: "tailscale-ssh", host: target.target.host, username: target.target.username },
+      } : {}),
       ...(isAccessClientManagedTarget(target)
         ? {
             connection: {
@@ -2749,6 +2783,7 @@ function renderFleetGatewayConfiguration(
         knownHostsFile: revision.knownHosts,
         connectTimeoutSeconds: 15,
       },
+      ...("tailscale" in profile && profile.tailscale !== undefined ? { tailscale: profile.tailscale } : {}),
       ...("accessClient" in profile && profile.accessClient !== undefined
         ? { putty: { executable: profile.accessClient.plinkExecutable } }
         : {}),
@@ -2805,7 +2840,7 @@ async function validateFleetOpenSshConfiguration(
   for (const [index, [alias, managedTarget]] of sortedStoredFleetEntries(
     profile,
   ).entries()) {
-    if (isAccessClientManagedTarget(managedTarget)) continue;
+    if (usesExternalIdentity(managedTarget)) continue;
     const credentials = fleetCredentialPaths(revision, alias);
     const sshAliases = fleetSshAliases(index);
     if (managedTarget.bastion !== undefined) {
@@ -2959,7 +2994,7 @@ async function validateFleetCredentialStorage(
   });
   const expectedAliases = new Set(
     sortedStoredFleetEntries(profile)
-      .filter(([, target]) => !isAccessClientManagedTarget(target))
+      .filter(([, target]) => !usesExternalIdentity(target))
       .map(([alias]) => alias),
   );
   for (const entry of entries) {
@@ -2982,7 +3017,7 @@ async function validateFleetCredentialStorage(
   }
 
   for (const [alias, target] of sortedStoredFleetEntries(profile)) {
-    if (isAccessClientManagedTarget(target)) continue;
+    if (usesExternalIdentity(target)) continue;
     const credentials = fleetCredentialPaths(revision, alias);
     await assertDirectDirectory(credentials.root, `${alias} credential directory`);
     const expectedFiles = new Set([
@@ -3030,7 +3065,7 @@ async function validateFleetCredentialStorage(
   const expectedKnownHosts = await aggregateKnownHosts(
     revision,
     sortedStoredFleetEntries(profile)
-      .filter(([, target]) => !isAccessClientManagedTarget(target))
+      .filter(([, target]) => !usesExternalIdentity(target))
       .map(([alias]) => alias),
   );
   const storedKnownHosts = await readFile(revision.knownHosts);
@@ -3047,7 +3082,7 @@ function assertManagedFleetCredentialPaths(
   profile: ManagedSshFleetProfile | StoredManagedSshFleetProfileV2,
 ): void {
   for (const [alias, target] of sortedStoredFleetEntries(profile)) {
-    if (isAccessClientManagedTarget(target)) continue;
+    if (usesExternalIdentity(target)) continue;
     const credentials = fleetCredentialPaths(revision, alias);
     const valid =
       comparablePath(target.knownHostsFile) ===
@@ -3076,7 +3111,7 @@ async function validateFleetCredentials(
 ): Promise<void> {
   await allSettledOrThrow(
     sortedStoredFleetEntries(profile).flatMap(([alias, target]) => {
-      if (isAccessClientManagedTarget(target)) return [];
+      if (usesExternalIdentity(target)) return [];
       const credentials = fleetCredentialPaths(revision, alias);
       return [
         validatePrivateKey(

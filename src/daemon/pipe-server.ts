@@ -92,6 +92,9 @@ export class PipeRpcServer {
 
   public async listen(): Promise<void> {
     if (process.platform !== "win32") {
+      if (Buffer.byteLength(this.#runtime.endpoint) > 103) {
+        throw new Error("Runtime directory is too long for a Unix socket; use a shorter managed directory");
+      }
       await unlink(this.#runtime.endpoint).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") {
           throw error;

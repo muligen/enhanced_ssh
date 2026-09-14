@@ -19,6 +19,7 @@ import { AuditWriter } from "../infra/audit-writer.js";
 import { HostKeyInspector } from "../infra/host-key-inspector.js";
 import { SshExecutor } from "../infra/openssh-executor.js";
 import { PuttySharedExecutor } from "../infra/putty-shared-executor.js";
+import { TailscaleSshExecutor } from "../infra/tailscale-ssh-executor.js";
 import { RoutingSshExecutor } from "../infra/routing-ssh-executor.js";
 import { SftpExecutor } from "../infra/sftp-executor.js";
 import type { SshRunner } from "../infra/ssh-runner.js";
@@ -75,10 +76,7 @@ async function assertRegularFile(filePath: string, label: string): Promise<void>
 
 async function validateRuntimeDependencies(
   config: GatewayConfig,
-): Promise<{ readonly supervisorPath: string; readonly sftpExecutable: string }> {
-  if (process.platform !== "win32") {
-    throw new Error("Phase 1 of Agent SSH Gateway supports Windows only");
-  }
+): Promise<{ readonly supervisorPath?: string; readonly sftpExecutable: string }> {
   const sftpExecutable =
     config.ssh.sftpExecutable ??
     path.join(
@@ -90,10 +88,15 @@ async function validateRuntimeDependencies(
     assertRegularFile(sftpExecutable, "ssh.sftpExecutable"),
     assertRegularFile(config.ssh.configFile, "ssh.configFile"),
     assertRegularFile(config.ssh.knownHostsFile, "ssh.knownHostsFile"),
+    ...(config.tailscale === undefined ? [] : [assertRegularFile(config.tailscale.executable, "tailscale.executable")]),
     ...(config.putty === undefined
       ? []
       : [assertRegularFile(config.putty.executable, "putty.executable")]),
   ]);
+
+  // POSIX uses the managed process group implementation; only Windows needs
+  // the native Job Object supervisor.
+  if (process.platform !== "win32") return { sftpExecutable };
 
   const supervisor = resolveWindowsSupervisorPath();
   if (supervisor === undefined) {
@@ -133,13 +136,32 @@ async function prepareGeneration(
       configFile: generatedSshConfig.path,
       knownHostsFile: config.ssh.knownHostsFile,
       connectTimeoutSeconds: config.ssh.connectTimeoutSeconds,
-      windowsSupervisorPath: supervisorPath,
+      ...(supervisorPath === undefined ? {} : { windowsSupervisorPath: supervisorPath }),
       allowUnsafeProcessTermination: false,
     });
     ownedRunners.add(openSshExecutor);
     const accessClientAliases = new Set<string>();
     const routes = new Map<string, SshRunner>();
+    const tailscaleRoutes = new Map<string, TailscaleSshExecutor>();
     for (const target of Object.values(config.targets)) {
+      if (target.connection?.mode === "tailscale-ssh") {
+        if (config.tailscale === undefined) throw new Error("Tailscale SSH requires tailscale.executable");
+        const route = new TailscaleSshExecutor({
+          executable: config.ssh.executable,
+          tailscaleExecutable: config.tailscale.executable,
+          runtimeDirectory: config.runtime.dataDirectory,
+          targetAlias: target.sshAlias,
+          host: target.connection.host,
+          username: target.connection.username,
+          connectTimeoutSeconds: config.ssh.connectTimeoutSeconds,
+          ...(supervisorPath === undefined ? {} : { windowsSupervisorPath: supervisorPath }),
+          allowUnsafeProcessTermination: false,
+        });
+        ownedRunners.add(route);
+        routes.set(target.sshAlias, route);
+        tailscaleRoutes.set(target.sshAlias, route);
+        continue;
+      }
       if (target.connection?.mode !== "accessclient-share") continue;
       if (config.putty === undefined) {
         throw new Error("AccessClient target requires putty.executable");
@@ -161,7 +183,7 @@ async function prepareGeneration(
           ? {}
           : { expectedHostname: target.connection.expectedHostname }),
         platform: target.platform,
-        windowsSupervisorPath: supervisorPath,
+        ...(supervisorPath === undefined ? {} : { windowsSupervisorPath: supervisorPath }),
         allowUnsafeProcessTermination: false,
       });
       ownedRunners.add(route);
@@ -174,7 +196,7 @@ async function prepareGeneration(
       configFile: generatedSshConfig.path,
       knownHostsFile: config.ssh.knownHostsFile,
       connectTimeoutSeconds: config.ssh.connectTimeoutSeconds,
-      windowsSupervisorPath: supervisorPath,
+      ...(supervisorPath === undefined ? {} : { windowsSupervisorPath: supervisorPath }),
       allowUnsafeProcessTermination: false,
     });
     const hostKeys = new HostKeyInspector({
@@ -184,6 +206,7 @@ async function prepareGeneration(
     });
     const hostKeyInspector: TrustedHostKeyInspector = Object.freeze({
       inspect: async (sshAlias: string): Promise<readonly string[]> =>
+        tailscaleRoutes.has(sshAlias) ? tailscaleRoutes.get(sshAlias)!.fingerprints :
         accessClientAliases.has(sshAlias)
           ? Object.freeze([])
           :

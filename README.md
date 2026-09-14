@@ -8,7 +8,7 @@ Agent SSH Gateway 是一个运行在 Windows 本机、面向 Codex 和其他 AI 
 
 ## 能力概览
 
-- **两种连接方式**：OpenSSH 私钥连接，或 AccessClient/PuTTY 已登录共享会话。
+- **三种连接方式**：OpenSSH 私钥、AccessClient/PuTTY 已登录共享会话，以及原生 Tailscale SSH。
 - **集中管理**：本机 Web 管理中心维护全局私钥库和最多 1,024 个目标；MCP 不暴露配置修改或私钥读取接口。
 - **三档权限**：精确单行命令白名单、`full-access` 和 `deny`，另有独立的目标启用开关。
 - **结构化执行**：Full access 目标支持固定 shell、工作目录、环境变量和多行脚本，不把脚本正文放进本机 `ssh.exe` 参数。
@@ -26,8 +26,8 @@ Agent SSH Gateway 是一个运行在 Windows 本机、面向 Codex 和其他 AI 
 flowchart LR
     A["管理员"] -->|"127.0.0.1 + UI token"| UI["Web 管理中心"]
     C["Codex / AI Agent"] -->|"stdio MCP"| MCP["agent-ssh-mcp"]
-    UI -->|"Named Pipe RPC v6"| G["Gateway daemon"]
-    MCP -->|"Named Pipe RPC v6"| G
+    UI -->|"Named Pipe RPC v8"| G["Gateway daemon"]
+    MCP -->|"Named Pipe RPC v8"| G
     G --> R["目标注册表与权限策略"]
     R --> J["Windows Job supervisor"]
     J --> O["OpenSSH ssh / sftp"]
@@ -108,7 +108,7 @@ npm run start:service -- --managed-directory C:\AgentSsh\managed --port 8765
 
 - 生成无口令的 Ed25519 私钥，或在兼容场景下生成 RSA 3072 私钥。
 - 或从本机绝对路径导入现有私钥。导入路径只是一次性输入，服务校验后将密钥复制到受保护的全局密钥库，不在机器配置或 MCP 状态中回显源路径。
-- 将页面展示的公钥加入目标账户的 `authorized_keys`。管理中心会根据目标平台生成可复制的首次安装命令。
+- 将页面展示的公钥加入目标账户的 `authorized_keys`。管理中心会根据目标平台生成首次安装命令，也可以点击“自动启动安装”打开本机终端；终端通过一次密码认证执行安装，密码不会进入网关或配置文件。
 
 每把密钥都有稳定的 `keyId`、名称、算法、指纹和公钥，可供多个目标或跳板机复用。仍被当前配置或保留 revision 引用的密钥不能删除。
 
@@ -149,6 +149,24 @@ AccessClient 模式复用本机已经登录的 PuTTY 共享连接，不读取 Ac
 
 每个目标最多维持一条受管 Plink 下游会话。同一目标的命令按 FIFO 执行，不同目标可并行；会话空闲 60 秒回收，绝对寿命为 10 分钟。AccessClient 模式当前只提供命令通道，上传、下载和目录同步始终关闭。
 
+## 配置原生 Tailscale SSH
+
+该连接方式使用本机 Tailscale 身份和 tailnet SSH 策略，不需要导入 SSH 私钥或手工维护 `known_hosts`。Gateway 的白名单、Full access、禁用开关仍独立生效；只有同时满足 Gateway 和 tailnet 授权的操作才能执行。
+
+1. 在运行 Gateway 的 **Windows 本机**安装并登录 Tailscale，使用正常的系统网络模式。确认 Windows OpenSSH Client 已安装。
+2. 远端使用支持 Tailscale SSH 服务端的 Linux，或受支持的 macOS 部署方式；在远端启用 Tailscale SSH，例如 `sudo tailscale set --ssh`。原生 Tailscale SSH 服务端不支持 Windows。
+3. 在 tailnet 管理侧配置到目标 TCP 22 的网络访问和 SSH 授权规则，允许 Gateway 节点身份登录指定远端账号。参考 [Tailscale SSH 官方说明](https://tailscale.com/kb/1193/tailscale-ssh)。Gateway 不会修改这些规则。
+4. 在“全局设置 → Tailscale SSH”保存本机 `tailscale.exe` 的绝对路径，例如 `C:\Program Files\Tailscale\tailscale.exe`。
+5. 新增机器，连接方式选择“Tailscale SSH”。填写 MagicDNS 短名称、完整域名或 Tailscale IP，以及远端系统账号（如 `ubuntu`）；端口固定为 22。选择命令权限、保存并检测连接。
+
+支持单行命令、Full access 结构化脚本、长任务、日志、超时与取消，以及现有固定探针。MCP 使用原有 `ssh_exec`、`ssh_start`、`ssh_status` 等工具，目标的 `connectionMode` 为 `tailscale-ssh`。本版此连接方式的上传、下载、同步均关闭，包括 Full access；普通 OpenSSH 和 AccessClient 的既有行为不变。
+
+每次执行前，Gateway 通过受管的 `tailscale status --json` 查询本机 daemon，只接受唯一匹配的 tailnet peer，并从其 `SSH_HostKeys` 严格校验主机密钥。随后直接连接该节点的 Tailscale IP，使用隔离的 OpenSSH 配置，关闭私钥、密码、agent、用户配置和转发；不依赖系统 MagicDNS 解析，不回退到普通 SSH 认证。此实现需要本机到 tailnet 的正常网络路由，暂不支持 userspace-networking 代理模式。
+
+若 SSH 策略要求 check 重新认证，请管理员在交互终端发起同一账号和目标的 Tailscale SSH 连接、完成认证后重试。管理中心不会自动打开或批准认证链接。缺少本机登录、找不到节点或目标未公布 SSH 主机密钥时，连接检测给出相应提示；网络或 SSH 策略拒绝不一定能仅凭退出码区分。
+
+本次扩展将内部 RPC 协议升级为 v8。更新后重新构建，并重启 Gateway 和现有 MCP 客户端进程。
+
 ## 权限模型
 
 下表描述 Web 管理中心保存的 v3 托管目标：
@@ -187,7 +205,7 @@ args = [
 
 这里的 `agent_ssh` 只是 Codex 中的 MCP 服务名；管理中心内的 `managed-ssh`、`dev-linux` 等才是工具参数 `target` 使用的目标。每个目标有不可变 `targetId`、当前别名和保存的历史别名，这些引用都会解析到同一条权限策略。
 
-daemon 与 MCP 当前使用内部协议 v6，并严格校验版本。Gateway 尚未启动或尚未配置时，MCP 仍可初始化；启动服务或保存配置后，下一次工具调用会重新读取 runtime 并自动恢复连接。
+daemon 与 MCP 当前使用内部协议 v8，并严格校验版本。Gateway 尚未启动或尚未配置时，MCP 仍可初始化；启动服务或保存配置后，下一次工具调用会重新读取 runtime 并自动恢复连接。
 
 可以直接对 Codex 说：
 

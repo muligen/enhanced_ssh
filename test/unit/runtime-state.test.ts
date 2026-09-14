@@ -25,6 +25,8 @@ import {
   type RuntimeLease,
 } from "../../src/daemon/runtime-state.js";
 
+import { PipeRpcServer } from "../../src/daemon/pipe-server.js";
+
 const execFileAsync = promisify(execFile);
 const ICACLS = "C:\\Windows\\System32\\icacls.exe";
 const POWERSHELL =
@@ -253,3 +255,23 @@ $rules = @($acl.GetAccessRules($true, $false, [System.Security.Principal.Securit
     rules: [...parsed.rules].sort((left, right) => left.sid.localeCompare(right.sid)),
   };
 }
+
+
+test("POSIX runtime binds a socket inside a long managed directory", { skip: process.platform === "win32" }, async (t) => {
+  const root = await mkdtemp("/tmp/ssh-socket-");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const directory = path.join(root, "x".repeat(72 - Buffer.byteLength(root) - 1));
+  const lease = await createRuntimeDescriptor(directory);
+  const server = new PipeRpcServer({
+    runtime: lease.descriptor,
+    serverVersion: "test",
+    dispatcher: { async dispatch() { return null; } },
+  });
+  try {
+    await server.listen();
+    assert.equal((await stat(lease.descriptor.endpoint)).isSocket(), true);
+  } finally {
+    await server.close();
+    await lease.release();
+  }
+});

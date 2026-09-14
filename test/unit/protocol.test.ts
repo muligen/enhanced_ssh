@@ -16,7 +16,7 @@ import {
 } from "../../src/shared/protocol.js";
 
 test("parseRpcRequest validates the session.open handshake", () => {
-  assert.equal(PROTOCOL_VERSION, 7);
+  assert.equal(PROTOCOL_VERSION, 8);
   const request = parseRpcRequest({
     jsonrpc: "2.0",
     id: "handshake-1",

@@ -38,6 +38,8 @@ managed lease 复用 daemon runtime lease 的所有者令牌和陈旧锁回收�
 
 管理服务从不自动运行或信任 `ssh-keyscan`。目标和堡垒机条目必须已经存在于导入的 `known_hosts`；非 22 端口按 OpenSSH `[host]:port` 形式查找。生成的端点配置强制 `IdentityAgent none`、`IdentitiesOnly yes`、禁用 password/keyboard-interactive，并把首选认证限制为 `publickey`。浏览器只会收到密钥 `keyId`、名称、算法、指纹、公钥、创建时间、来源和机器引用关系；不会收到托管私钥路径、导入源路径、`identityFile`、私钥内容、导入文件内容或外部命令错误详情。导入源路径由管理员在本机页面主动提交，但服务端不会把它回显或放入后续状态响应。
 
+OpenSSH 首次公钥安装由用户明确点击“自动启动安装”后在本机终端中进行。网关只拼接固定认证选项和经过校验的目标字段，密码提示由 OpenSSH 终端处理，不会被网关读取、保存或写入命令行参数；远端安装脚本只追加所选公钥并设置账户 `.ssh` 权限。
+
 应用层堡垒机透传目标不是 `ProxyJump`：它通过结构化三段用户名让入口 SSH 服务选择后端资产。每个透传会话必须作为独立目标，不能同时再配置页面中的堡垒机跳转。此模式下 host-key 校验和 `ssh_target_info` 看到的是透传入口的 SSH 主机密钥；Gateway 不声称取得或验证后端资产本身的主机密钥。管理员必须通过独立可信渠道核验入口指纹。
 
 HTTP server 固定绑定 `127.0.0.1`，产品入口默认端口 52075；不能绑定外部网卡。每次启动生成独立的 256-bit 首次授权 token，启动 URL 通过 fragment 携带它，页面读取后立即清除 fragment。首次鉴权成功后签发 HttpOnly、SameSite=Strict、Path=/、30 天滚动有效期 Cookie；之后不需要 URL token 或浏览器 JavaScript 存储。Cookie 的 HMAC-SHA256 签名绑定完整 origin 和到期时间，托管目录 browser-session.key 保存经 ACL 加固的随机签名密钥，因此服务重启不会撤销浏览器授权。Cookie 名包含端口；Cookie 本身不能由浏览器按端口隔离，其他本机服务仍属于同一账户信任边界。本机 HTTP 不设置 Secure，部署不得改为对外 HTTP。
@@ -160,3 +162,14 @@ stdout/stderr 可能包含敏感数据。同步执行的内联结果会返回调
 - IPC 帧限制为 1 MiB，但当前增量解析会反复合并碎片。持有会话 token 的本地客户端可用极端碎片化输入增加 daemon 的 CPU 开销。
 - 审计中的命令 SHA-256 是稳定指纹，不等同于不可逆匿名化。能够猜测 allow-list 的审计读取者可以离线枚举命令，因此审计文件仍必须按敏感数据保护。
 - 热加载不并行排空旧、新 generation；有活动执行时配置保存返回 `CONFIG_BUSY`，管理员必须在执行结束后重试。
+
+
+## 原生 Tailscale SSH 的信任边界
+
+`tailscale-ssh` 使用已经登录的本机 Tailscale daemon 作为节点与 SSH 主机密钥来源。每次操作先以受管进程执行管理员配置的 `tailscale.exe status --json`，限制输出和查询时限；必须匹配唯一的 tailnet peer、有效 Tailscale 地址和已公布的 SSH 主机密钥。未知节点、缺少密钥或本机未登录时均拒绝，不使用 `ssh-keyscan`，不关闭主机校验，也不回退到本机私钥认证。完整 status JSON 和本机 CLI 错误不进入公共输出或审计。
+
+SSH 通过固定的 OpenSSH 可执行文件直连解析后的 Tailscale IP，使用 runtime 下受保护的每次调用专用配置及 known_hosts。正常完成或失败后清理临时文件；进程异常退出可能留下仅含节点地址、公钥及连接选项的受保护临时目录，不含私钥。用户 ssh_config、代理、密钥、SSH agent、密码和转发均被禁用。本版要求 Windows 正常 Tailscale 网络模式；不提供 userspace-networking 代理。
+
+远端授权由 tailnet 网络规则、SSH 策略及远端账号权限控制；Gateway 仍独立执行自身命令策略、限额、取消和审计。Tailscale 设备身份的权限可能大于 Gateway 对 Agent 授予的权限，不能用本机同账户隔离假设替代操作系统边界。目标名称解析与主机密钥均跟随本机 daemon 当前可信的 tailnet 状态。
+
+Tailscale check 模式需要管理员交互认证，Gateway 不批准认证链接或修改 tailnet 策略。Tailscale SSH 仅支持 Linux/macOS 服务端；本次扩展不改变 Gateway 的 Windows 运行端限制。本版在配置、注册表授权和 UI 中关闭 Tailscale SSH 的文件传输，包括 Full access。取消保证仍限于本机进程树，不能保证撤销已经发生的远端副作用。

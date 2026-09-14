@@ -153,7 +153,7 @@ async function writeRuntimeDescriptor(
   const endpoint =
     process.platform === "win32"
       ? `\\\\.\\pipe\\agent-ssh-gateway-${nonce}`
-      : path.join(dataDirectory, `gateway-${nonce}.sock`);
+      : path.join(dataDirectory, `${Buffer.from(nonce, "hex").toString("base64url")}.sock`);
   const descriptor: RuntimeDescriptor = {
     version: 1,
     pid: process.pid,

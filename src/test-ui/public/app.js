@@ -48,6 +48,7 @@ const TRANSFER_LABELS = Object.freeze({
 const CONNECTION_MODE_LABELS = Object.freeze({
   openssh: "OpenSSH",
   "accessclient-share": "AccessClient",
+  "tailscale-ssh": "Tailscale SSH",
 });
 
 const fragment = new URLSearchParams(window.location.hash.slice(1));
@@ -86,6 +87,10 @@ const elements = {
   gatewayDetail: document.querySelector("#gateway-detail"),
   refreshButton: document.querySelector("#refresh-button"),
   machineCount: document.querySelector("#machine-count"),
+  machineSearch: document.querySelector("#machine-search"),
+  inventoryNoResults: document.querySelector("#inventory-no-results"),
+  actionHint: document.querySelector("#action-hint"),
+  breadcrumbCurrent: document.querySelector("#breadcrumb-current"),
   machineList: document.querySelector("#machine-list"),
   inventoryEmpty: document.querySelector("#inventory-empty"),
   inventoryError: document.querySelector("#inventory-error"),
@@ -104,6 +109,10 @@ const elements = {
   machineForm: document.querySelector("#machine-form"),
   targetAlias: document.querySelector("#target-alias"),
   targetDescription: document.querySelector("#target-description"),
+  targetPortField: document.querySelector("#target-port-field"),
+  targetKeyField: document.querySelector("#target-key-field"),
+  knownHostsField: document.querySelector("#known-hosts-field"),
+  tailscaleConnectionNote: document.querySelector("#tailscale-connection-note"),
   platformInputs: [...document.querySelectorAll('input[name="platform"]')],
   connectionModeInputs: [...document.querySelectorAll('input[name="connection-mode"]')],
   targetHost: document.querySelector("#target-host"),
@@ -115,6 +124,7 @@ const elements = {
   targetManageKeysButton: document.querySelector("#target-manage-keys-button"),
   sshInstallGuide: document.querySelector("#ssh-install-guide"),
   sshInstallCommand: document.querySelector("#ssh-install-command"),
+  launchSshInstallButton: document.querySelector("#launch-ssh-install-button"),
   copySshInstallCommandButton: document.querySelector("#copy-ssh-install-command-button"),
   knownHostsFile: document.querySelector("#known-hosts-file"),
   knownHostsNote: document.querySelector("#known-hosts-note"),
@@ -184,6 +194,15 @@ const elements = {
   accessClientSettingsDetail: document.querySelector("#accessclient-settings-detail"),
   accessClientSettingsError: document.querySelector("#accessclient-settings-error"),
   accessClientSettingsStatus: document.querySelector("#accessclient-settings-status"),
+  tailscaleSettingsForm: document.querySelector("#tailscale-settings-form"),
+  tailscaleExecutable: document.querySelector("#tailscale-executable"),
+  saveTailscaleSettingsButton: document.querySelector("#save-tailscale-settings-button"),
+  tailscaleSettingsBadge: document.querySelector("#tailscale-settings-badge"),
+  tailscaleSettingsDot: document.querySelector("#tailscale-settings-dot"),
+  tailscaleSettingsLabel: document.querySelector("#tailscale-settings-label"),
+  tailscaleSettingsDetail: document.querySelector("#tailscale-settings-detail"),
+  tailscaleSettingsError: document.querySelector("#tailscale-settings-error"),
+  tailscaleSettingsStatus: document.querySelector("#tailscale-settings-status"),
   commandTargetName: document.querySelector("#command-target-name"),
   commandPolicyBadge: document.querySelector("#command-policy-badge"),
   operationTabs: [...document.querySelectorAll(".operation-tab")],
@@ -259,6 +278,10 @@ const state = {
   targets: new Map(),
   keys: new Map(),
   keyRevision: null,
+  tailscaleSettings: { executable: "" },
+  tailscaleSettingsBaseline: "",
+  tailscaleSettingsDirty: false,
+  tailscaleMutationBusy: false,
   accessClientSettings: { plinkExecutable: "" },
   accessClientSettingsBaseline: "",
   accessClientSettingsDirty: false,
@@ -357,7 +380,7 @@ async function refreshApplication(options = {}) {
     state.refreshing ||
     state.mutationBusy ||
     state.keyMutationBusy ||
-    state.accessClientMutationBusy ||
+    state.tailscaleMutationBusy || state.accessClientMutationBusy ||
     state.running
   ) {
     return;
@@ -370,6 +393,7 @@ async function refreshApplication(options = {}) {
   updateControls();
   clearAlert(elements.inventoryError);
   clearAlert(elements.keyError);
+  clearAlert(elements.tailscaleSettingsError);
   clearAlert(elements.accessClientSettingsError);
   state.keyLoadError = null;
   setGatewayState("checking", "正在读取配置", "本机管理服务");
@@ -458,6 +482,7 @@ function applyFleetStatus(rawStatus, options = {}) {
     applyAccessClientPreparationSnapshot(status.accessClientSession);
   }
   applyAccessClientSettingsSnapshot(status, options.preserveAccessClientDraft === true);
+  applyTailscaleSettingsSnapshot(status, options.preserveAccessClientDraft === true);
   if (!applyKeySnapshot(status)) {
     showAlert(
       elements.keyError,
@@ -512,13 +537,25 @@ function applyAccessClientSettingsSnapshot(rawStatus, preserveDraft = false) {
   renderAccessClientSettings();
 }
 
+function applyTailscaleSettingsSnapshot(rawStatus, preserveDraft = false) {
+  const status = rawStatus?.status && typeof rawStatus.status === "object" ? rawStatus.status : rawStatus;
+  const draft = elements.tailscaleExecutable.value;
+  const wasDirty = state.tailscaleSettingsDirty;
+  const executable = typeof status?.profile?.tailscale?.executable === "string"
+    ? status.profile.tailscale.executable
+    : "";
+  state.tailscaleSettings = { executable };
+  state.tailscaleSettingsBaseline = executable;
+  elements.tailscaleExecutable.value = preserveDraft && wasDirty ? draft : executable;
+  state.tailscaleSettingsDirty = elements.tailscaleExecutable.value.trim() !== executable;
+  renderTailscaleSettings();
+}
+
 function normaliseFleetTarget(value) {
   if (!value || typeof value !== "object") {
     return null;
   }
-  const connectionMode = value.connectionMode === "accessclient-share"
-    ? "accessclient-share"
-    : "openssh";
+  const connectionMode = Object.hasOwn(CONNECTION_MODE_LABELS, value.connectionMode) ? value.connectionMode : "openssh";
   const targetEndpoint = normaliseEndpoint(value.target);
   if (!targetEndpoint) return null;
   const bastionEndpoint = connectionMode === "openssh" ? normaliseEndpoint(value.bastion) : null;
@@ -536,7 +573,7 @@ function normaliseFleetTarget(value) {
     target: targetEndpoint,
     ...(connectionMode === "openssh"
       ? { knownHostsFile: typeof value.knownHostsFile === "string" ? value.knownHostsFile : "" }
-      : { accessClient }),
+      : connectionMode === "accessclient-share" ? { accessClient } : {}),
     ...(bastionEndpoint ? { bastion: bastionEndpoint } : {}),
     platform,
     policyMode,
@@ -544,7 +581,7 @@ function normaliseFleetTarget(value) {
       ? value.allowedCommands.filter((command) => typeof command === "string")
       : [],
     maxTimeoutMs: validInteger(value.maxTimeoutMs, 1, MAX_TIMEOUT_MS) ? value.maxTimeoutMs : 30_000,
-    transferMode: policyMode === "full-access"
+    transferMode: connectionMode === "tailscale-ssh" ? "deny" : policyMode === "full-access"
         ? "bidirectional"
       : policyMode === "deny"
         ? "deny"
@@ -794,7 +831,7 @@ function normaliseSshPublicKey(value) {
 
 function buildSshInstallCommand(platform, publicKey) {
   if (platform === "windows") {
-    return `$k='${publicKey}';$d=Join-Path $env:USERPROFILE '.ssh';$f=Join-Path $d 'authorized_keys';$utf8=[Text.UTF8Encoding]::new($false);[IO.Directory]::CreateDirectory($d)|Out-Null;if(!(Test-Path -LiteralPath $f)){[IO.File]::WriteAllText($f,'',$utf8)};$p=$k -split ' ';$exists=[IO.File]::ReadAllLines($f)|Where-Object{$line=$_ -split '\\s+';for($i=0;$i-lt $line.Count-1;$i++){if($line[$i] -ceq $p[0] -and $line[$i+1] -ceq $p[1]){return $true}}return $false}|Select-Object -First 1;if(!$exists){[IO.File]::AppendAllText($f,[Environment]::NewLine+$k+[Environment]::NewLine,$utf8)};$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;& icacls.exe $d /inheritance:r /grant:r "*$($sid):(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"|Out-Null;& icacls.exe $f /inheritance:r /grant:r "*$($sid):F" "*S-1-5-18:F"|Out-Null`;
+    return `$k='${publicKey}';$utf8=[Text.UTF8Encoding]::new($false);$id=[Security.Principal.WindowsIdentity]::GetCurrent();$p=[Security.Principal.WindowsPrincipal]::new($id);if($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){$d=Join-Path $env:ProgramData 'ssh';$f=Join-Path $d 'administrators_authorized_keys'}else{$d=Join-Path $env:USERPROFILE '.ssh';$f=Join-Path $d 'authorized_keys'};[IO.Directory]::CreateDirectory($d)|Out-Null;if(!(Test-Path -LiteralPath $f)){[IO.File]::WriteAllText($f,'',$utf8)};$parts=$k -split ' ';$exists=[IO.File]::ReadAllLines($f)|Where-Object{$line=$_ -split '\\s+';for($i=0;$i-lt $line.Count-1;$i++){if($line[$i] -ceq $parts[0] -and $line[$i+1] -ceq $parts[1]){return $true}}return $false}|Select-Object -First 1;if(!$exists){[IO.File]::AppendAllText($f,[Environment]::NewLine+$k+[Environment]::NewLine,$utf8)};if($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){& icacls.exe $d /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F'|Out-Null;& icacls.exe $f /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F'|Out-Null}else{$sid=$id.User.Value;& icacls.exe $d /inheritance:r /grant:r "*$($sid):(OI)(CI)F" '*S-1-5-18:(OI)(CI)F'|Out-Null;& icacls.exe $f /inheritance:r /grant:r "*$($sid):F" '*S-1-5-18:F'|Out-Null}`;
   }
   return `umask 077; k='${publicKey}'; d="$HOME/.ssh"; f="$d/authorized_keys"; mkdir -p "$d" && chmod 700 "$d" && touch "$f" && chmod 600 "$f" && { awk -v k="$k" 'BEGIN { split(k,p," ") } { for (i=1; i<NF; i++) if ($i==p[1] && $(i+1)==p[2]) found=1 } END { exit found ? 0 : 1 }' "$f" || printf '\\n%s\\n' "$k" >> "$f"; }`;
 }
@@ -808,6 +845,7 @@ function renderSshInstallGuide() {
   elements.sshInstallCommand.textContent = visible
     ? buildSshInstallCommand(selectedRadio(elements.platformInputs) ?? "linux", publicKey)
     : "";
+  elements.launchSshInstallButton.disabled = !visible;
   elements.copySshInstallCommandButton.disabled = !visible;
 }
 
@@ -817,12 +855,19 @@ function renderInventory() {
   elements.machineCount.textContent = String(targets.length);
   elements.inventoryEmpty.hidden = targets.length > 0;
   elements.machineList.hidden = targets.length === 0;
-  for (const [alias, target] of targets) {
+  const query = elements.machineSearch.value.trim().toLocaleLowerCase();
+  const matches = targets.filter(([alias, target]) =>
+    [alias, target.description, target.target.host, target.target.username]
+      .some((value) => String(value ?? "").toLocaleLowerCase().includes(query)),
+  );
+  elements.inventoryNoResults.hidden = targets.length === 0 || matches.length > 0;
+  for (const [alias, target] of matches) {
     elements.machineList.append(createMachineItem(alias, target));
   }
 }
 
 function renderUnavailableInventory() {
+  elements.inventoryNoResults.hidden = true;
   elements.machineCount.textContent = "--";
   elements.inventoryEmpty.hidden = true;
   elements.machineList.hidden = true;
@@ -831,6 +876,7 @@ function renderUnavailableInventory() {
 }
 
 function renderPendingInventory() {
+  elements.inventoryNoResults.hidden = true;
   elements.machineCount.textContent = "--";
   elements.inventoryEmpty.hidden = true;
   elements.machineList.hidden = true;
@@ -943,7 +989,7 @@ async function setMachineEnabled(alias, enabled) {
   if (
     state.mutationBusy ||
     state.keyMutationBusy ||
-    state.accessClientMutationBusy ||
+    state.tailscaleMutationBusy || state.accessClientMutationBusy ||
     state.checking ||
     state.inspecting ||
     state.running ||
@@ -1168,6 +1214,10 @@ function handleFormChange(event) {
     renderPermissionFields();
   }
   if (event.target === elements.targetKeyId) renderKeyNotes();
+  if (event.target.matches('input[name="connection-mode"]') && selectedRadio(elements.connectionModeInputs) === "tailscale-ssh" && selectedRadio(elements.platformInputs) === "windows") {
+    selectRadio(elements.platformInputs, "linux");
+    updatePresetForPlatform("linux");
+  }
   renderConnectionFields();
   renderPermissionFields();
   state.dirty = rawFormSnapshot() !== state.baseline;
@@ -1178,6 +1228,14 @@ function handleFormChange(event) {
 
 function renderConnectionFields() {
   const accessClient = selectedRadio(elements.connectionModeInputs) === "accessclient-share";
+  const tailscale = selectedRadio(elements.connectionModeInputs) === "tailscale-ssh";
+  elements.tailscaleConnectionNote.hidden = !tailscale;
+  elements.targetPortField.hidden = tailscale;
+  elements.targetKeyField.hidden = tailscale;
+  elements.knownHostsField.hidden = tailscale;
+  elements.openSshConnectionFields.classList.toggle("tailscale-endpoint", tailscale);
+  elements.targetHost.placeholder = tailscale ? "例如 build-server 或 100.101.102.103" : "IP 地址或域名";
+  elements.targetUsername.placeholder = tailscale ? "远端系统账号，例如 ubuntu" : "user 或 portal/10.0.0.1/root";
   elements.openSshConnectionFields.hidden = accessClient;
   elements.accessClientConnectionFields.hidden = !accessClient;
   renderSshInstallGuide();
@@ -1199,18 +1257,19 @@ function renderPermissionFields() {
   const policyMode = selectedRadio(elements.policyInputs) ?? "allow-list";
   const selectedTransferMode = selectedRadio(elements.transferInputs) ?? "deny";
   const accessClient = selectedRadio(elements.connectionModeInputs) === "accessclient-share";
-  const transferMode = policyMode === "full-access"
+  const tailscale = selectedRadio(elements.connectionModeInputs) === "tailscale-ssh";
+  const transferMode = tailscale ? "deny" : policyMode === "full-access"
       ? "bidirectional"
     : policyMode === "deny"
       ? "deny"
       : selectedTransferMode;
-  const restrictedTransferEnabled = !accessClient && policyMode === "allow-list" && transferMode !== "deny";
+  const restrictedTransferEnabled = !accessClient && !tailscale && policyMode === "allow-list" && transferMode !== "deny";
   elements.allowListFields.hidden = policyMode !== "allow-list";
   elements.fullAccessWarning.hidden = policyMode !== "full-access";
   elements.denyNote.hidden = policyMode !== "deny";
   elements.permissionLimits.hidden = policyMode === "deny";
   elements.transferFields.hidden = !restrictedTransferEnabled;
-  elements.transferDenyNote.hidden = accessClient || policyMode !== "allow-list" || restrictedTransferEnabled;
+  elements.transferDenyNote.hidden = accessClient || tailscale || policyMode !== "allow-list" || restrictedTransferEnabled;
   elements.accessClientTransferNote.hidden = !accessClient || policyMode === "deny";
   elements.transferTimeoutField.hidden = !restrictedTransferEnabled;
   elements.restrictedTransferSummary.textContent = TRANSFER_LABELS[transferMode];
@@ -1221,6 +1280,11 @@ function renderPermissionFields() {
     ? "Codex 可以执行任意命令，并通过持久化 Plink 通道使用任意本机或远端绝对路径双向传输文件。每次保存都必须重新确认。"
     : "Codex 可以执行任意命令，并可使用任意本机或远端绝对路径双向传输文件，包括读取本机私钥、凭证等敏感文件，以及修改配置、停止服务或删除数据。每次保存都必须重新确认。";
   elements.fullAccessConfirmText.textContent = "我已核对目标机器，并确认授予 Codex 完整命令权限和全部本机、远端文件权限。";
+  if (tailscale) {
+    elements.fullAccessHeading.textContent = "Full access 将开放完整命令权限";
+    elements.fullAccessDescription.textContent = "Agent 可在远端账号权限范围内执行任意命令，包括修改配置、停止服务或删除数据。Tailscale SSH 暂不提供文件传输。";
+    elements.fullAccessConfirmText.textContent = "我已核对目标机器，并确认授予 Agent 完整远端命令权限。";
+  }
 }
 
 function setActiveOperation(operation, moveFocus = false) {
@@ -1366,10 +1430,8 @@ function renderDirtyState() {
   if (state.dirty) {
     elements.savedIndicator.textContent = state.activeView === "settings" ? "机器配置有未保存修改" : "有未保存修改";
     elements.savedIndicator.className = "saved-indicator is-dirty";
-  } else if (state.accessClientSettingsDirty) {
-    elements.savedIndicator.textContent = state.activeView === "settings"
-      ? "AccessClient 设置有未保存修改"
-      : "全局设置有未保存修改";
+  } else if (state.accessClientSettingsDirty || state.tailscaleSettingsDirty) {
+    elements.savedIndicator.textContent = "全局设置有未保存修改";
     elements.savedIndicator.className = "saved-indicator is-dirty";
   } else if (state.activeView === "settings") {
     elements.savedIndicator.textContent = "";
@@ -1384,12 +1446,14 @@ function renderDirtyState() {
 }
 
 function renderWorkspaceHeading() {
+  elements.breadcrumbCurrent.textContent = state.activeView === "settings" ? "全局设置" : "机器管理";
   if (state.activeView === "settings") {
     elements.workspaceTitle.textContent = "全局设置";
     const accessClientConfigured = state.accessClientSettings.plinkExecutable.length > 0;
+    const tailscaleSummary = ` · Tailscale ${state.tailscaleSettings.executable ? "已配置" : "未配置"}`;
     elements.workspaceSubtitle.textContent = state.keysLoaded
-      ? `${state.keys.size} 把 SSH 私钥 · AccessClient ${accessClientConfigured ? "已配置" : "未配置"}`
-      : `正在读取全局私钥 · AccessClient ${accessClientConfigured ? "已配置" : "未配置"}`;
+      ? `${state.keys.size} 把 SSH 私钥 · AccessClient ${accessClientConfigured ? "已配置" : "未配置"}${tailscaleSummary}`
+      : `正在读取全局私钥 · AccessClient ${accessClientConfigured ? "已配置" : "未配置"}${tailscaleSummary}`;
     elements.selectedStateBadge.textContent = state.keysAvailable ? "可管理" : state.keysLoaded ? "只读" : "加载中";
     elements.selectedStateBadge.className = `state-badge ${state.keysAvailable ? "is-enabled" : "is-draft"}`;
     return;
@@ -1398,7 +1462,7 @@ function renderWorkspaceHeading() {
   const target = alias ? state.targets.get(alias) : null;
   if (!target) {
     elements.workspaceTitle.textContent = "新增机器";
-    elements.workspaceSubtitle.textContent = "填写真实服务器连接信息。";
+    elements.workspaceSubtitle.textContent = "配置服务器连接与 Agent 访问权限，保存后即可检测连接。";
     elements.selectedStateBadge.textContent = "未保存";
     elements.selectedStateBadge.className = "state-badge is-draft";
     return;
@@ -1414,6 +1478,7 @@ function setActiveView(view, moveFocus = false) {
   if (view === "command" && !state.selectedAlias) {
     view = "config";
   }
+  const viewChanged = state.activeView !== view;
   state.activeView = view;
   const views = [
     { name: "config", tab: elements.configTab, panel: elements.configPanel },
@@ -1430,6 +1495,7 @@ function setActiveView(view, moveFocus = false) {
   }
   renderWorkspaceHeading();
   renderDirtyState();
+  if (viewChanged) window.scrollTo?.({ top: 0, behavior: "instant" });
 }
 
 function handleWorkspaceTabKeydown(event) {
@@ -1467,9 +1533,13 @@ function collectForm(options = {}) {
   if (description.length > 256 || /[\u0000-\u001f\u007f]/u.test(description)) {
     return invalid(elements.targetDescription, "说明不能包含控制字符，且最多 256 个字符。");
   }
-  const connectionMode = selectedRadio(elements.connectionModeInputs) === "accessclient-share"
-    ? "accessclient-share"
-    : "openssh";
+  const connectionMode = selectedRadio(elements.connectionModeInputs) ?? "openssh";
+  if (connectionMode === "tailscale-ssh") {
+    if (!state.tailscaleSettings.executable) return invalid(elements.connectionModeInputs.find((input) => input.value === "tailscale-ssh"), "请先在全局设置保存 Tailscale 程序路径。");
+    if (selectedRadio(elements.platformInputs) === "windows") return invalid(elements.platformInputs[0], "原生 Tailscale SSH 服务端支持 Linux 和 macOS。");
+    if (!/^[A-Za-z_][A-Za-z0-9._-]*$/u.test(elements.targetUsername.value.trim())) return invalid(elements.targetUsername, "请填写远端系统账号，例如 ubuntu 或 root。");
+    elements.targetPort.value = "22";
+  }
   let knownHostsFile;
   let accessClient;
   if (connectionMode === "openssh") {
@@ -1549,7 +1619,7 @@ function collectForm(options = {}) {
     return invalid(elements.maxTimeoutMs, "最长执行时间必须是 1 至 3,600,000 毫秒的整数。");
   }
   const selectedTransferMode = selectedRadio(elements.transferInputs) ?? "deny";
-  const transferMode = connectionMode === "accessclient-share"
+  const transferMode = connectionMode !== "openssh"
     ? "deny"
     : policyMode === "full-access"
       ? "bidirectional"
@@ -1593,12 +1663,12 @@ function collectForm(options = {}) {
       target: endpoint.endpoint,
       ...(connectionMode === "openssh"
         ? { knownHostsFile }
-        : { accessClient }),
+        : connectionMode === "accessclient-share" ? { accessClient } : {}),
       platform: selectedRadio(elements.platformInputs) ?? "linux",
       policyMode,
       allowedCommands: policyMode === "allow-list" ? allowedCommands : [],
       maxTimeoutMs,
-      ...(connectionMode === "accessclient-share"
+      ...(connectionMode !== "openssh"
         ? { transferMode: "deny" }
         : policyMode === "allow-list"
         ? {
@@ -1656,7 +1726,7 @@ async function saveMachine(event) {
   if (
     state.mutationBusy ||
     state.keyMutationBusy ||
-    state.accessClientMutationBusy ||
+    state.tailscaleMutationBusy || state.accessClientMutationBusy ||
     state.checking ||
     state.inspecting ||
     state.running
@@ -1710,7 +1780,7 @@ async function removeMachine() {
     !alias ||
     state.mutationBusy ||
     state.keyMutationBusy ||
-    state.accessClientMutationBusy ||
+    state.tailscaleMutationBusy || state.accessClientMutationBusy ||
     state.checking ||
     state.inspecting ||
     state.running
@@ -1771,7 +1841,7 @@ function handleAccessClientSettingsInput() {
 async function saveAccessClientSettings(event) {
   event.preventDefault();
   if (
-    state.accessClientMutationBusy ||
+    state.tailscaleMutationBusy || state.accessClientMutationBusy ||
     state.mutationBusy ||
     state.keyMutationBusy ||
     state.checking ||
@@ -1824,6 +1894,86 @@ async function saveAccessClientSettings(event) {
     showAlert(elements.accessClientSettingsError, messageForError(error), "error");
   } finally {
     state.accessClientMutationBusy = false;
+    updateControls();
+  }
+}
+
+function renderTailscaleSettings() {
+  const configured = state.tailscaleSettings.executable.length > 0;
+  elements.tailscaleSettingsBadge.textContent = configured ? "已配置" : "未配置";
+  elements.tailscaleSettingsBadge.className = `state-badge ${configured ? "is-enabled" : "is-draft"}`;
+  elements.tailscaleSettingsDot.className = `status-dot ${configured ? "is-online" : "is-idle"}`;
+  elements.tailscaleSettingsLabel.textContent = configured ? "Tailscale 路径已保存" : "尚未配置 Tailscale";
+  elements.tailscaleSettingsDetail.textContent = configured
+    ? "请在对应机器使用“检测连接”确认 Tailscale 登录状态、目标身份和 SSH 授权。"
+    : "先保存 Tailscale 路径，再在机器配置选择 Tailscale SSH。";
+}
+
+function handleTailscaleSettingsInput() {
+  state.tailscaleSettingsDirty =
+    elements.tailscaleExecutable.value.trim() !== state.tailscaleSettingsBaseline;
+  clearAlert(elements.tailscaleSettingsError);
+  clearAlert(elements.tailscaleSettingsStatus);
+  renderDirtyState();
+  updateControls();
+}
+
+async function saveTailscaleSettings(event) {
+  event.preventDefault();
+  if (
+    state.tailscaleMutationBusy || state.accessClientMutationBusy ||
+    state.mutationBusy ||
+    state.keyMutationBusy ||
+    state.checking ||
+    state.inspecting ||
+    state.running ||
+    !state.inventoryAvailable
+  ) {
+    return;
+  }
+  const executable = elements.tailscaleExecutable.value.trim();
+  if (
+    !WINDOWS_ABSOLUTE_FILE_PATTERN.test(executable) ||
+    /[\u0000-\u001f\u007f"$]/u.test(executable) ||
+    executable.startsWith("\\\\") ||
+    executable.slice(3).includes(":")
+  ) {
+    elements.tailscaleExecutable.setAttribute("aria-invalid", "true");
+    elements.tailscaleExecutable.focus();
+    showAlert(
+      elements.tailscaleSettingsError,
+      "请填写本机 Tailscale 程序的 Windows 绝对路径。",
+      "error",
+    );
+    return;
+  }
+  elements.tailscaleExecutable.removeAttribute("aria-invalid");
+  state.tailscaleMutationBusy = true;
+  clearAlert(elements.tailscaleSettingsError);
+  showAlert(elements.tailscaleSettingsStatus, "正在验证并保存 Tailscale 路径...", "progress");
+  updateControls();
+  try {
+    const result = await postApi("admin/tailscale/save", {
+      executable,
+      ...(typeof state.fleetStatus?.revision === "string"
+        ? { expectedRevision: state.fleetStatus.revision }
+        : {}),
+    });
+    const status = result?.status && typeof result.status === "object" ? result.status : result;
+    state.fleetStatus = status && typeof status === "object" ? status : state.fleetStatus;
+    applyTailscaleSettingsSnapshot(status);
+    if (typeof status?.revision === "string") {
+      elements.revisionLabel.textContent = status.revision;
+      elements.revisionLabel.title = status.revision;
+    }
+    renderWorkspaceHeading();
+    renderDirtyState();
+    showAlert(elements.tailscaleSettingsStatus, "Tailscale 路径已保存。", "success");
+    showToast("Tailscale 设置已保存");
+  } catch (error) {
+    showAlert(elements.tailscaleSettingsError, messageForError(error), "error");
+  } finally {
+    state.tailscaleMutationBusy = false;
     updateControls();
   }
 }
@@ -1914,7 +2064,7 @@ function openKeyEditor(mode, key = null) {
     !state.keysAvailable ||
     state.keyMutationBusy ||
     state.mutationBusy ||
-    state.accessClientMutationBusy ||
+    state.tailscaleMutationBusy || state.accessClientMutationBusy ||
     state.checking ||
     state.inspecting ||
     state.running
@@ -1988,7 +2138,7 @@ function invalidKeyEditor(input, message) {
 
 async function submitKeyEditor(event) {
   event.preventDefault();
-  if (!state.keyEditorMode || state.keyMutationBusy || state.mutationBusy || state.accessClientMutationBusy || state.running) return;
+  if (!state.keyEditorMode || state.keyMutationBusy || state.mutationBusy || state.tailscaleMutationBusy || state.accessClientMutationBusy || state.running) return;
   const form = collectKeyEditor();
   if (form.error) return;
   if (!state.keyRevision) {
@@ -2032,7 +2182,7 @@ async function submitKeyEditor(event) {
 }
 
 async function removeKey(key) {
-  if (state.keyMutationBusy || state.mutationBusy || state.accessClientMutationBusy || state.running || !state.keysAvailable) return;
+  if (state.keyMutationBusy || state.mutationBusy || state.tailscaleMutationBusy || state.accessClientMutationBusy || state.running || !state.keysAvailable) return;
   if (key.inUseBy.length > 0) {
     showAlert(elements.keyError, `${key.label}${keyUsageText(key)}，不能删除。`, "error");
     return;
@@ -2272,7 +2422,7 @@ async function cancelAccessClientPreparation() {
 
 async function checkConnection() {
   const alias = state.originalAlias;
-  if (!alias || state.dirty || state.checking || state.mutationBusy || state.accessClientMutationBusy || state.running) {
+  if (!alias || state.dirty || state.checking || state.mutationBusy || state.tailscaleMutationBusy || state.accessClientMutationBusy || state.running) {
     return;
   }
   state.checking = true;
@@ -2334,6 +2484,9 @@ async function checkConnection() {
 
 function checkFailureLabel(result) {
   const failureLabels = {
+    "tailscale-unavailable": "本机 Tailscale 不可用，请确认程序路径、服务状态并登录 tailnet",
+    "tailscale-peer-unavailable": "找不到唯一的 Tailscale 节点，请检查名称、IP 和 tailnet 可见性",
+    "tailscale-host-key-unavailable": "目标未公布可用的 Tailscale SSH 主机密钥，请确认远端已启用 Tailscale SSH",
     "accessclient-session-unavailable": "AccessClient 共享会话不可用，请先在 AccessClient 中打开并登录这台机器",
     "accessclient-session-timeout": "AccessClient 共享会话在等待时限内未就绪，请保持目标会话打开后重试",
     "accessclient-host-mismatch": "AccessClient 当前共享会话连接到了另一台机器，请切换到配置的目标",
@@ -3122,6 +3275,41 @@ async function copySshInstallCommand() {
   );
 }
 
+async function launchSshInstall() {
+  if (
+    state.mutationBusy ||
+    state.keyMutationBusy ||
+    state.tailscaleMutationBusy ||
+    state.accessClientMutationBusy ||
+    state.checking ||
+    state.inspecting ||
+    state.running ||
+    !elements.sshInstallCommand.textContent
+  ) return;
+  clearFormMessages();
+  const form = collectForm({ requireFullConfirmation: false });
+  if (form.error || form.target.connectionMode !== "openssh") return;
+  elements.launchSshInstallButton.disabled = true;
+  showAlert(
+    elements.formStatus,
+    "正在打开终端，请在终端中输入远端账号密码；密码不会保存到网关。",
+    "progress",
+  );
+  try {
+    await postApi("admin/ssh/install", { target: form.target });
+    showAlert(
+      elements.formStatus,
+      "终端已打开。公钥安装完成后，回到这里保存配置并检测连接。",
+      "success",
+    );
+    showToast("SSH 公钥安装终端已打开");
+  } catch (error) {
+    showAlert(elements.formError, messageForError(error), "error");
+  } finally {
+    updateControls();
+  }
+}
+
 async function copyOutput() {
   const page = state.outputPages[state.activeStream];
   const text = page.mode === "full" ? page.text : state.result?.[state.activeStream]?.text ?? "";
@@ -3155,10 +3343,12 @@ async function copyWithFeedback(text, button, toastText) {
 }
 
 function updateControls() {
-  const blocked = state.refreshing || state.mutationBusy || state.keyMutationBusy || state.accessClientMutationBusy || state.accessClientPreparationBusy || state.checking || state.inspecting;
+  const blocked = state.refreshing || state.mutationBusy || state.keyMutationBusy || state.tailscaleMutationBusy || state.accessClientMutationBusy || state.accessClientPreparationBusy || state.checking || state.inspecting;
   const inventoryBlocked = !state.inventoryAvailable;
   const selectedTarget = state.selectedAlias ? state.targets.get(state.selectedAlias) : null;
   const accessClientDraft = selectedRadio(elements.connectionModeInputs) === "accessclient-share";
+  const tailscaleDraft = selectedRadio(elements.connectionModeInputs) === "tailscale-ssh";
+  const externalIdentity = accessClientDraft || tailscaleDraft;
   const preparationActive = accessClientPreparationIsActive();
   elements.refreshButton.disabled = blocked || state.running;
   elements.newMachineButton.disabled = blocked || state.running || inventoryBlocked || preparationActive;
@@ -3185,11 +3375,24 @@ function updateControls() {
     ? "正在准备..."
     : "准备会话";
   elements.cancelAccessClientPrepareButton.disabled = state.accessClientPreparationBusy;
-  const selectedKeysAvailable = accessClientDraft || state.keys.has(elements.targetKeyId.value);
+  const selectedKeysAvailable = externalIdentity || state.keys.has(elements.targetKeyId.value);
   elements.saveButton.disabled = blocked || state.running || inventoryBlocked || preparationActive
-    || (!accessClientDraft && !state.keysAvailable)
+    || (!externalIdentity && !state.keysAvailable)
     || !selectedKeysAvailable;
   elements.saveButton.textContent = state.mutationBusy ? "正在处理..." : "保存配置";
+  elements.actionHint.textContent = inventoryBlocked
+    ? "配置暂不可用，请刷新管理中心。"
+    : state.mutationBusy ? "正在保存配置，请稍候…"
+    : state.checking ? "正在检测连接，请稍候…"
+    : preparationActive ? "正在准备 AccessClient 会话，请按上方提示操作。"
+    : state.running ? "任务运行中，结束后可修改配置。"
+    : !externalIdentity && !state.keysAvailable ? "私钥库不可用，请在全局设置中检查。"
+    : !selectedKeysAvailable ? "请先在全局设置中添加并选择私钥。"
+    : !state.originalAlias ? "配置填写完成后保存，再检测连接。"
+    : state.dirty ? "有未保存的修改 · 保存后可检测连接。"
+    : "配置已保存，可以检测连接或执行命令。";
+  elements.checkButton.title = !state.originalAlias || state.dirty ? "请先保存机器配置，再检测连接" : "检测这台机器的 SSH 连接";
+  elements.commandTab.title = !state.selectedAlias ? "保存机器后可执行命令" : "执行命令、传输文件与检查机器";
   const keyBlocked = blocked || state.running || preparationActive || !state.keysAvailable || !state.keyRevision;
   elements.generateKeyButton.disabled = keyBlocked;
   elements.importKeyButton.disabled = keyBlocked;
@@ -3201,6 +3404,11 @@ function updateControls() {
       || control.dataset.unavailable === "true";
   }
   elements.copyPublicKeyButton.disabled = !elements.publicKeyOutput.textContent;
+  elements.launchSshInstallButton.disabled = blocked
+    || state.running
+    || inventoryBlocked
+    || preparationActive
+    || !elements.sshInstallCommand.textContent;
   elements.copySshInstallCommandButton.disabled = blocked
     || state.running
     || inventoryBlocked
@@ -3229,9 +3437,14 @@ function updateControls() {
     input.disabled = operationBlocked || !supportedShells.has(input.value);
   }
   for (const input of elements.transferInputs) {
-    if (accessClientDraft) input.disabled = true;
+    if (externalIdentity) input.disabled = true;
   }
 
+  const windowsPlatform = elements.platformInputs.find((input) => input.value === "windows");
+  if (tailscaleDraft && windowsPlatform) windowsPlatform.disabled = true;
+  elements.tailscaleExecutable.disabled = blocked || state.running || inventoryBlocked || preparationActive;
+  elements.saveTailscaleSettingsButton.disabled = elements.tailscaleExecutable.disabled || !state.tailscaleSettingsDirty;
+  elements.saveTailscaleSettingsButton.textContent = state.tailscaleMutationBusy ? "正在保存..." : "保存 Tailscale 路径";
   const accessClientSettingsBlocked = blocked || state.running || inventoryBlocked || preparationActive;
   elements.plinkExecutable.disabled = accessClientSettingsBlocked;
   elements.saveAccessClientSettingsButton.disabled = accessClientSettingsBlocked || !state.accessClientSettingsDirty;
@@ -3409,8 +3622,23 @@ function messageForError(error) {
 }
 
 elements.refreshButton.addEventListener("click", () => {
-  if ((!state.dirty && !state.accessClientSettingsDirty) || confirmDiscardChanges()) {
+  if ((!state.dirty && !state.accessClientSettingsDirty && !state.tailscaleSettingsDirty) || confirmDiscardChanges()) {
     void refreshApplication();
+  }
+});
+elements.machineSearch.addEventListener("input", () => {
+  if (state.inventoryAvailable) {
+    renderInventory();
+    updateControls();
+  }
+});
+elements.machineSearch.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    elements.machineSearch.value = "";
+    if (state.inventoryAvailable) {
+      renderInventory();
+      updateControls();
+    }
   }
 });
 elements.newMachineButton.addEventListener("click", () => startNewMachine());
@@ -3423,7 +3651,10 @@ elements.importKeyButton.addEventListener("click", () => openKeyEditor("import")
 elements.keyEditorForm.addEventListener("submit", submitKeyEditor);
 elements.cancelKeyEditorButton.addEventListener("click", closeKeyEditor);
 elements.copyPublicKeyButton.addEventListener("click", copyPublicKey);
+elements.launchSshInstallButton.addEventListener("click", launchSshInstall);
 elements.copySshInstallCommandButton.addEventListener("click", copySshInstallCommand);
+elements.tailscaleSettingsForm.addEventListener("input", handleTailscaleSettingsInput);
+elements.tailscaleSettingsForm.addEventListener("submit", saveTailscaleSettings);
 elements.accessClientSettingsForm.addEventListener("input", handleAccessClientSettingsInput);
 elements.accessClientSettingsForm.addEventListener("submit", saveAccessClientSettings);
 elements.targetManageKeysButton.addEventListener("click", () => setActiveView("settings"));
