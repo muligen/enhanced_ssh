@@ -297,12 +297,7 @@ Linux/macOS: /srv/services" rows="4" spellcheck="false"></textarea>
 </form>
 </div>
 <div aria-labelledby="settings-tab" class="tab-panel settings-panel" hidden="" id="settings-panel" role="tabpanel">
-<section aria-labelledby="preset-library-heading" class="form-section"><div class="section-heading"><h3 id="preset-library-heading">内置权限预设 <span class="count-badge">v1 · 4 组</span></h3></div><div class="section-body">
-<p class="section-note">在机器的「权限管理 → 预设命令组」中选用。内置模板不可编辑；本次新增功能不会自动改变机器现有权限。</p>
-<dl class="preset-library"><div><dt>基础巡检</dt><dd>固定模板读取系统、CPU、内存、磁盘、进程与端口摘要，限制执行时间和输出。</dd></div><div><dt>日志排查</dt><dd>按机器授权的精确文件路径或服务读取有限日志，不允许任意路径和脚本。</dd></div><div><dt>Docker 只读巡检</dt><dd>查看容器列表、状态、资源、健康和有限日志，不提供容器内命令执行。</dd></div><div><dt>Docker 保护</dt><dd>不授予操作。仅与受限预设组合，关闭任意执行及文件传输入口；禁止启停、重建、删除等变更。</dd></div></dl>
-<p class="section-note">MCP 先调用 <code>ssh_list_allowed_operations</code> 查看本机可用操作，再调用 <code>ssh_run_operation</code> 执行。预设仅约束本工具，不能限制其他登录会话。</p>
-</div></section>
-<section aria-labelledby="key-management-heading" class="form-section"><div class="section-heading key-management-heading">
+<section aria-labelledby="key-management-heading" class="form-section settings-keys"><div class="section-heading key-management-heading">
 <div>
 
 <h3 id="key-management-heading">私钥管理 <span class="count-badge" id="key-count">--</span></h3>
@@ -357,7 +352,7 @@ Linux/macOS: /srv/services" rows="4" spellcheck="false"></textarea>
 <p class="field-note">将公钥加入远端账号的 authorized_keys 后再检测连接。</p>
 </section>
 </div></section>
-<section aria-labelledby="accessclient-settings-heading" class="form-section"><div class="section-heading accessclient-settings-heading">
+<section aria-labelledby="accessclient-settings-heading" class="form-section settings-provider"><div class="section-heading accessclient-settings-heading">
 <div>
 
 <h3 id="accessclient-settings-heading">PuTTY 共享连接</h3>
@@ -384,7 +379,7 @@ Linux/macOS: /srv/services" rows="4" spellcheck="false"></textarea>
 </div>
 </div>
 </div></section>
-<section aria-labelledby="tailscale-settings-heading" class="form-section"><div class="section-heading tailscale-settings-heading">
+<section aria-labelledby="tailscale-settings-heading" class="form-section settings-provider"><div class="section-heading tailscale-settings-heading">
 <div>
 
 <h3 id="tailscale-settings-heading">Tailscale SSH</h3>
@@ -410,6 +405,52 @@ Linux/macOS: /srv/services" rows="4" spellcheck="false"></textarea>
 <p id="tailscale-settings-detail">保存路径后，在机器配置中选择 Tailscale SSH。连接可用性由“检测连接”确认。</p>
 </div>
 </div>
+</div></section>
+<section aria-labelledby="project-guide-heading" class="form-section project-guide">
+<div class="section-heading"><h3 id="project-guide-heading">项目说明</h3><span class="count-badge">配置与 MCP 使用指南</span></div>
+<div class="section-body">
+<p class="guide-intro">SSH 工作台在本机管理机器、凭证和权限，通过 MCP 让 Codex 连接机器、执行运维任务、传输文件，也支持按分组批量操作。先在管理页配好机器，再在已接入本项目 MCP 的 Codex 对话中描述任务。</p>
+<ol class="guide-steps">
+<li><strong>配置连接</strong><span>按连接方式选择私钥、Plink 或 Tailscale；不是每一项都要配置。</span></li>
+<li><strong>添加机器</strong><span>填写 IP、账号、系统及所属分组，设置权限，保存后检测连接。</span></li>
+<li><strong>交给 Codex</strong><span>打开左侧机器的 MCP 开关，告诉 Codex 要操作哪台机器或哪个分组。</span></li>
+</ol>
+<div class="guide-examples" aria-labelledby="group-guide-heading">
+<div class="guide-subheading"><h4 id="group-guide-heading">分组批量操作</h4><span>可以直接这样对 Codex 说</span></div>
+<article class="guide-example"><h5>A 组资源巡检</h5><p class="guide-prompt">“检查 A 组所有机器的 CPU 占用，汇总平均值，按占用从高到低列出，并单独说明连接失败或权限不足的机器。”</p><p>先在左侧新建 A 组，用机器卡片的移动按钮分配成员。机器需选用「基础巡检」预设或完全访问；平均值只统计成功采样。</p><p><code>ssh_list_groups → ssh_group_cpu({"group":"A组"})</code></p></article>
+<article class="guide-example"><h5>B 组安装 Docker</h5><p class="guide-prompt">“检查 B 组机器的系统和 Docker 状态，跳过已经安装的机器。先给我安装方案，确认后批量安装，并逐台汇报结果。”</p><p>安装需要远端账号具备相应权限，以及机器允许执行安装命令；任意安装脚本需完全访问。混合系统要分别提供对应脚本，长任务可查询进度、跟随日志和取消。</p><p><code>ssh_group_start → ssh_group_status</code>；逐台日志使用 <code>ssh_tail</code>。</p></article>
+<p class="guide-note">组控按任务开始时选中的机器执行，逐台检查权限并返回结果；分组不会额外授予权限。失败或取消不会自动撤销已经完成的远端操作。</p>
+</div>
+<details class="guide-details"><summary>各项配置有什么用</summary>
+<dl class="guide-definitions">
+<div><dt>私钥管理</dt><dd>导入或生成本机 SSH 私钥，多台 OpenSSH 机器可复用同一把。机器页下拉选择；首次连接把对应公钥写入远端账号，私钥留在本机。</dd></div>
+<div><dt>PuTTY 共享连接</dt><dd>填写本机 <code>plink.exe</code> 路径，用于 AccessClient 堡垒机连接。先在 AccessClient 打开并登录目标 PuTTY 会话，再检测连接；需要匹配会话时按机器页提示重新打开。保持该会话可用，工具会复用连接执行任务。</dd></div>
+<div><dt>Tailscale SSH</dt><dd>填写已安装的 Tailscale 程序路径。本机需登录 Tailnet，远端需启用 Tailscale SSH 并获网络策略授权；远端支持 Linux、macOS。此连接方式当前不提供文件传输。</dd></div>
+<div><dt>机器 IP、说明、分组</dt><dd>IP 是实际连接地址；说明用来区分机器用途；分组用于整理列表和批量任务。默认分组不可删除，机器上的 MCP 开关控制该目标是否可被调用。</dd></div>
+<div><dt>系统、账号、端口</dt><dd>系统决定脚本及巡检指令格式；账号决定远端操作身份；SSH 端口通常为 22，可按实际服务修改。完全访问也不会自动获得远端管理员权限。</dd></div>
+<div><dt>known_hosts</dt><dd>保存已信任的服务器主机密钥，用于确认连接的是正确服务器；它与用于登录的用户公钥不同。首次连接应核对服务器指纹。</dd></div>
+<div><dt>命令与传输上限</dt><dd>命令最长时间与文件传输最长时间分别设置。使用后台任务不会绕过上限；构建和大文件任务应提前设置足够时长。</dd></div>
+<div><dt>文件传输目录</dt><dd>受限传输要配置允许方向、本机目录和远端目录；上传、下载及同步均受这些权限限制。完全访问开放任意绝对路径，预设命令模式不开放文件传输。</dd></div>
+</dl>
+</details>
+<details class="guide-details"><summary id="preset-library-heading">权限模式与 4 组内置预设</summary>
+<p>在每台机器的「权限管理」中选择。预设命令组执行固定巡检操作；白名单只放行已配置的命令；完全访问允许任意命令及文件操作；禁止访问不授予运维执行权限。</p>
+<dl class="preset-library"><div><dt>基础巡检</dt><dd>固定模板读取系统、CPU、内存、磁盘、进程与端口摘要，限制执行时间和输出。</dd></div><div><dt>日志排查</dt><dd>按机器授权的精确文件路径或服务读取有限日志，不允许任意路径和脚本。</dd></div><div><dt>Docker 只读巡检</dt><dd>查看容器列表、状态、资源、健康和有限日志，不提供容器内命令执行。</dd></div><div><dt>Docker 保护</dt><dd>自身不授予操作，可与受限巡检预设组合；关闭任意执行与文件传输入口，禁止 Docker 启停、重建和删除等变更。不能作为完全访问模式下的额外黑名单。</dd></div></dl>
+<p>Codex 先调用 <code>ssh_list_allowed_operations</code> 查看允许的操作及参数，再用 <code>ssh_run_operation</code> 执行。模板不可编辑；预设只约束本工具，不限制其他 SSH 登录会话。</p>
+</details>
+<details class="guide-details"><summary>MCP 提供哪些服务、怎么调用 · 24 个工具</summary>
+<p>通常直接向 Codex 描述需求即可。工具中的 <code>target</code> 使用 <code>ssh_list_targets</code> 返回的机器 ID 或别名，不需要向对话粘贴私钥。</p>
+<div class="guide-table-wrap"><table class="guide-table"><thead><tr><th scope="col">服务</th><th scope="col">MCP 工具</th><th scope="col">使用方式</th></tr></thead><tbody>
+<tr><th scope="row">服务与连接</th><td><code>ssh_gateway_status</code> · <code>ssh_ping</code><br/><code>ssh_open_admin</code> · <code>ssh_list_targets</code><br/><code>ssh_check_connection</code></td><td>“列出可用机器，检查这台机器能否连接。”网关在线不等于每台远端机器都能连接，需逐台检测。</td></tr>
+<tr><th scope="row">单机命令</th><td><code>ssh_exec</code><br/><code>ssh_list_allowed_operations</code><br/><code>ssh_run_operation</code></td><td>“查看这台机器的磁盘使用情况。”短命令同步执行；完全访问支持 shell、script、cwd、env；预设模式使用固定操作接口。</td></tr>
+<tr><th scope="row">分组批量</th><td><code>ssh_list_groups</code> · <code>ssh_group_cpu</code><br/><code>ssh_group_start</code> · <code>ssh_group_status</code><br/><code>ssh_group_cancel</code></td><td>group 使用列表返回的完整组名，默认组填「默认分组」。批量执行用 common 共享命令，或 platforms.linux / windows / macos 分别指定；二者选一。默认并行 2 台，最多 4 台；禁用机器跳过，失败逐台报告。</td></tr>
+<tr><th scope="row">长任务</th><td><code>ssh_start</code> · <code>ssh_status</code><br/><code>ssh_tail</code> · <code>ssh_cancel</code></td><td>构建、安装等任务先取得 runId，再查状态、读取增量日志或取消。MCP 客户端断开后后台任务仍可运行，但本地网关需保持启动。</td></tr>
+<tr><th scope="row">文件传输</th><td><code>ssh_upload</code> · <code>ssh_download</code><br/><code>ssh_sync</code></td><td>“把本机项目同步到远端，排除 node_modules，先 dryRun。”本机路径指运行网关的电脑。上传、下载支持校验和及续传参数；sync 为本机到远端的单向目录同步，不删除远端多余文件。OpenSSH 使用 SFTP，AccessClient 复用共享 shell；按授权目录执行，用 runId 跟踪。</td></tr>
+<tr><th scope="row">环境与部署预检</th><td><code>ssh_target_info</code><br/><code>ssh_docker_preflight</code></td><td>“确认机器身份、Docker 状态和剩余磁盘，检查部署端口。”Docker 预检目前需要完全访问权限，只检查，不安装或部署；提供项目名与 create / update / inspect 意图可区分本项目占用。</td></tr>
+<tr><th scope="row">大输出读取</th><td><code>ssh_read_output_text</code><br/><code>ssh_read_output</code></td><td>输出预览截断时，用返回的 outputRef 分页读取。文本优先使用文本接口；原始接口返回 Base64 数据。</td></tr>
+</tbody></table></div>
+<p>分组任务返回 <code>groupRunId</code>，每台机器另有 <code>runId</code>。分组协调依赖当前 MCP 进程，完成后的组记录保留 24 小时；MCP 重启会丢失组记录及未派发队列，已派发任务可继续用各自 runId 查询或取消。取消分组后仍需查询最终状态。</p>
+</details>
 </div></section>
 </div>
 <div aria-labelledby="command-tab" class="tab-panel command-panel" hidden="" id="command-panel" role="tabpanel"><div class="operation-header"><div class="command-target-banner" id="command-target-banner">
