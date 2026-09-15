@@ -192,6 +192,7 @@ async function startTestGateway(
                 targetId: "t-44444444444444444444444444444444",
                 alias: targetAlias,
                 description: `Test target ${targetAlias}`,
+                group: "A组",
                 enabled: true,
                 platform: "linux",
                 policyMode: "allow-list",
@@ -298,11 +299,18 @@ test(
         "ssh_download",
         "ssh_exec",
         "ssh_gateway_status",
+        "ssh_group_cancel",
+        "ssh_group_cpu",
+        "ssh_group_start",
+        "ssh_group_status",
+        "ssh_list_allowed_operations",
+        "ssh_list_groups",
         "ssh_list_targets",
         "ssh_open_admin",
         "ssh_ping",
         "ssh_read_output",
         "ssh_read_output_text",
+        "ssh_run_operation",
         "ssh_start",
         "ssh_status",
         "ssh_sync",
@@ -329,6 +337,9 @@ test(
       "accessclient-session-timeout",
       "accessclient-host-mismatch",
       "accessclient-session-ended",
+      "tailscale-unavailable",
+      "tailscale-peer-unavailable",
+      "tailscale-host-key-unavailable",
     ]);
 
     const initialStatus = structuredContent(
@@ -399,6 +410,14 @@ test(
     assert.equal(check.hostname, "first-target.example");
 
     const firstRuntime = gateway.runtime;
+    const listedGroups = structuredContent(await peer.request("tools/call", {
+      name: "ssh_list_groups", arguments: {},
+    }));
+    assert.equal(listedGroups.ungroupedCount, 0);
+    const group = (listedGroups.groups as Array<{ group: string; total: number; targets: Array<{ alias: string }> }>).find(item => item.group === "A组")!;
+    assert.equal(group.group, "A组");
+    assert.equal(group.total, 1);
+    assert.equal(group.targets[0]?.alias, "first-target");
     const firstTargets = structuredContent(
       await peer.request("tools/call", {
         name: "ssh_list_targets",

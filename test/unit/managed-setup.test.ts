@@ -7,6 +7,7 @@ import {
   currentManagedSshProfileSchema,
   managedSshFleetProfileSchema,
   managedSshProfileSchema,
+  normalizeFleetGroups,
   type CurrentManagedSshProfile,
   type ManagedSshFleetProfile,
 } from "../../src/test-ui/managed.js";
@@ -86,6 +87,34 @@ function validAccessClientFleetProfile(): Record<string, unknown> {
     },
   };
 }
+
+test("fleet catalog preserves empty groups, migrates legacy membership, and reserves the default name", () => {
+  const fleet = validFleetProfile();
+  fleet.targets["dev-linux"]!.group = "Legacy";
+  assert.equal(managedSshFleetProfileSchema.parse(fleet).groups, undefined);
+  assert.deepEqual(normalizeFleetGroups(fleet).groups, ["Legacy"]);
+  fleet.groups = ["Empty"];
+  assert.deepEqual(normalizeFleetGroups(fleet).groups, ["Empty", "Legacy"]);
+  fleet.targets["dev-linux"]!.group = "默认分组";
+  assert.equal(normalizeFleetGroups(fleet).targets["dev-linux"]!.group, undefined);
+  assert.deepEqual(normalizeFleetGroups(fleet).groups, ["Empty"]);
+  for (const groups of [["默认分组"], ["A", "A"], [" A ", "A"]]) {
+    assert.equal(managedSshFleetProfileSchema.safeParse({ ...fleet, groups }).success, false);
+  }
+});
+
+test("fleet group names round-trip without changing legacy ungrouped targets", () => {
+  const fleet = validFleetProfile();
+  assert.equal(managedSshFleetProfileSchema.parse(fleet).targets["dev-linux"]?.group, undefined);
+  fleet.targets["dev-linux"]!.group = "  A 组  ";
+  const parsed = managedSshFleetProfileSchema.parse(fleet);
+  assert.equal(parsed.targets["dev-linux"]?.group, "A 组");
+  assert.deepEqual(managedSshFleetProfileSchema.parse(JSON.parse(JSON.stringify(parsed))), parsed);
+  for (const group of ["", "   ", "a".repeat(65), "A\n", "A\tB", "A\u0000B", "A\u007f"]) {
+    fleet.targets["dev-linux"]!.group = group;
+    assert.equal(managedSshFleetProfileSchema.safeParse(fleet).success, false, JSON.stringify(group));
+  }
+});
 
 test("managed profile accepts strict target and optional bastion endpoints", () => {
   const profile = validProfile();

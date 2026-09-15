@@ -8,7 +8,8 @@ import {
   type TrustedHostKeyInspector,
 } from "../core/exec-service.js";
 import { OutputStore } from "../core/output-store.js";
-import { TargetRegistry } from "../core/target-registry.js";
+import { TargetRegistry, type GatewayMetadataUpdate } from "../core/target-registry.js";
+export type { GatewayMetadataUpdate } from "../core/target-registry.js";
 import { TaskStore } from "../core/task-store.js";
 import { TransferService } from "../core/transfer-service.js";
 import {
@@ -45,6 +46,7 @@ export interface RunningGatewayDaemon {
   readonly dataDirectory: string;
   activate(): void;
   reload(configPath: string): Promise<void>;
+  updateMetadata(metadata: GatewayMetadataUpdate): void;
   stop(): Promise<void>;
 }
 
@@ -566,6 +568,16 @@ export async function startGatewayDaemon(
       };
       void operation.then(clearOperation, clearOperation);
       return operation;
+    },
+    updateMetadata: (metadata: GatewayMetadataUpdate): void => {
+      if (stopping !== undefined) {
+        throw new ExecServiceReloadError("SERVICE_CLOSING", "Gateway metadata cannot update while the service is stopping");
+      }
+      if (reloadOperation !== undefined) {
+        throw new ExecServiceReloadError("RELOAD_IN_PROGRESS", "Gateway configuration reload is already in progress");
+      }
+      const registry = service!.updateMetadata(metadata);
+      transferService!.replaceMetadataRegistry(registry);
     },
     stop,
   });

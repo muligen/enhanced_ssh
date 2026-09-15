@@ -1,20 +1,45 @@
 import { createHash } from "node:crypto";
+import { z } from "zod";
 
-import type { GatewayConfig, TargetConfig } from "../config/load-config.js";
+import { targetConfigSchema, type GatewayConfig, type TargetConfig } from "../config/load-config.js";
 import { GATEWAY_ERROR_CODES, GatewayError } from "../shared/errors.js";
+import {
+  PERMISSION_PRESETS,
+  buildPresetOperation,
+  listPresetOperations,
+  permissionPresetSelectionSchema,
+  operationRequestSchema,
+} from "../shared/operation-presets.js";
 import {
   MAX_COMMAND_BYTES,
   MAX_TIMEOUT_MS,
   TARGET_ALIAS_PATTERN,
+  DEFAULT_TARGET_GROUP,
+  targetAliasSchema,
+  targetGroupCatalogSchema,
   type TargetConnectionMode,
   type TargetSummary,
 } from "../shared/protocol.js";
+
+const gatewayMetadataUpdateSchema = z.strictObject({
+  groups: targetGroupCatalogSchema.optional(),
+  targets: z.record(targetAliasSchema, targetConfigSchema.pick({ group: true, description: true })),
+});
+
+export interface GatewayMetadataUpdate {
+  readonly groups?: readonly string[] | undefined;
+  readonly targets: Readonly<Record<string, {
+    readonly group?: string | undefined;
+    readonly description?: string | undefined;
+  }>>;
+}
 
 export interface RegisteredTarget {
   readonly targetId: string;
   readonly alias: string;
   readonly sshAlias: string;
   readonly description?: string;
+  readonly group?: string;
   readonly enabled: boolean;
   readonly platform: TargetSummary["platform"];
   readonly connectionMode: TargetConnectionMode;
@@ -54,6 +79,7 @@ interface RegistryEntry {
   readonly target: RegisteredTarget;
   readonly allowedCommands: ReadonlySet<string>;
   readonly transfer: TargetConfig["transfer"] | undefined;
+  readonly presetSelection?: z.infer<typeof permissionPresetSelectionSchema>;
 }
 
 const MAX_ERROR_CANDIDATES = 8;
@@ -71,6 +97,7 @@ function createEntry(alias: string, config: RegistryTargetConfig): RegistryEntry
     targetId: config.targetId ?? legacyTargetId(alias, config.sshAlias),
     alias,
     sshAlias: config.sshAlias,
+    ...(config.group === undefined ? {} : { group: config.group }),
     ...(config.description === undefined
       ? {}
       : { description: config.description }),
@@ -79,12 +106,12 @@ function createEntry(alias: string, config: RegistryTargetConfig): RegistryEntry
     connectionMode:
       config.connection?.mode ?? "openssh",
     policyMode: config.policy.mode,
-    transferMode: config.connection?.mode === "tailscale-ssh" ? "deny" : unrestrictedTransfer
+    transferMode: config.policy.mode === "presets" || config.connection?.mode === "tailscale-ssh" ? "deny" : unrestrictedTransfer
       ? "bidirectional"
       : (config.transfer?.mode ?? "deny"),
     transferScope: unrestrictedTransfer ? "all" : "restricted",
     transferRoots: Object.freeze(
-      unrestrictedTransfer ? [] : [...(config.transfer?.localRoots ?? [])],
+      unrestrictedTransfer || config.policy.mode === "presets" ? [] : [...(config.transfer?.localRoots ?? [])],
     ),
     maxTimeoutMs: config.policy.maxTimeoutMs,
     maxTransferTimeoutMs:
@@ -101,6 +128,13 @@ function createEntry(alias: string, config: RegistryTargetConfig): RegistryEntry
     target,
     allowedCommands,
     transfer: config.transfer,
+    ...(config.policy.mode === "presets" ? {
+      presetSelection: permissionPresetSelectionSchema.parse({
+        presets: [...config.policy.presets],
+        logPaths: [...config.policy.logPaths],
+        logServices: [...config.policy.logServices],
+      }),
+    } : {}),
   });
 }
 
@@ -108,6 +142,7 @@ function toSummary(target: RegisteredTarget): TargetSummary {
   return Object.freeze({
     targetId: target.targetId,
     alias: target.alias,
+    ...(target.group === undefined ? {} : { group: target.group }),
     ...(target.description === undefined
       ? {}
       : { description: target.description }),
@@ -124,15 +159,19 @@ function toSummary(target: RegisteredTarget): TargetSummary {
 }
 
 export class TargetRegistry {
+  readonly #configs: Readonly<Record<string, RegistryTargetConfig>>;
   readonly #entries: ReadonlyMap<string, RegistryEntry>;
   readonly #references: ReadonlyMap<string, RegistryEntry>;
   readonly #summaries: readonly TargetSummary[];
   readonly #localRoots: Readonly<Record<string, string>>;
+  readonly #groups: readonly string[];
 
   public constructor(
     configs: Readonly<Record<string, RegistryTargetConfig>>,
     localRoots: Readonly<Record<string, string>> = {},
+    groups: readonly string[] = [],
   ) {
+    this.#configs = structuredClone(configs);
     const entries = new Map<string, RegistryEntry>();
     const references = new Map<string, RegistryEntry>();
     for (const [alias, config] of Object.entries(configs)) {
@@ -156,6 +195,11 @@ export class TargetRegistry {
     this.#entries = entries;
     this.#references = references;
     this.#localRoots = Object.freeze({ ...localRoots });
+    this.#groups = Object.freeze([...new Set([
+      ...groups,
+      ...Object.values(configs).flatMap((target) =>
+        target.group === undefined || target.group === DEFAULT_TARGET_GROUP ? [] : [target.group]),
+    ])]);
     this.#summaries = Object.freeze(
       [...entries.values()]
         .map((entry) => toSummary(entry.target))
@@ -164,12 +208,81 @@ export class TargetRegistry {
   }
 
   public static fromConfig(config: GatewayConfig): TargetRegistry {
-    return new TargetRegistry(config.targets, config.transfer.localRoots);
+    return new TargetRegistry(config.targets, config.transfer.localRoots, config.groups);
+  }
+
+  /** Metadata-only replacement: no connection, identity, policy or runner may change. */
+  public withMetadata(input: GatewayMetadataUpdate): TargetRegistry {
+    const parsed = gatewayMetadataUpdateSchema.safeParse(input);
+    if (!parsed.success) {
+      throw new GatewayError(GATEWAY_ERROR_CODES.configInvalid, "Gateway metadata update contains invalid or operational fields");
+    }
+    const metadata = parsed.data;
+    const aliases = Object.keys(this.#configs);
+    if (Object.keys(metadata.targets).length !== aliases.length ||
+        aliases.some((alias) => !Object.hasOwn(metadata.targets, alias))) {
+      throw new GatewayError(GATEWAY_ERROR_CODES.configInvalid, "Gateway metadata update must preserve every target alias");
+    }
+    const groups = metadata.groups ?? this.#groups;
+    const configs: Record<string, RegistryTargetConfig> = Object.create(null) as Record<string, RegistryTargetConfig>;
+    for (const alias of aliases) {
+      const { group: _group, description: _description, ...operational } = this.#configs[alias]!;
+      const next = metadata.targets[alias]!;
+      if (next.group !== undefined && next.group !== DEFAULT_TARGET_GROUP && !groups.includes(next.group)) {
+        throw new GatewayError(GATEWAY_ERROR_CODES.configInvalid, "Gateway metadata target references an unknown group");
+      }
+      configs[alias] = {
+        ...operational,
+        ...(next.group === undefined || next.group === DEFAULT_TARGET_GROUP ? {} : { group: next.group }),
+        ...(next.description === undefined ? {} : { description: next.description }),
+      };
+    }
+    return new TargetRegistry(configs, this.#localRoots, groups);
   }
 
   /** Returns immutable public metadata and never exposes sshAlias or patterns. */
   public list(): readonly TargetSummary[] {
     return this.#summaries;
+  }
+
+  public listGroups(): readonly string[] {
+    return this.#groups;
+  }
+
+  public listAllowedOperations(alias: string) {
+    const target = this.require(alias);
+    const selection = this.#entries.get(target.alias)?.presetSelection;
+    return {
+      target: target.alias,
+      presets: PERMISSION_PRESETS,
+      operations: selection === undefined ? [] : listPresetOperations(selection, target.platform),
+    };
+  }
+
+  /** Only catalogue-generated scripts cross this authorization boundary. */
+  public authorizeOperation(
+    alias: string,
+    request: z.infer<typeof operationRequestSchema>,
+    requestedTimeoutMs?: number,
+  ) {
+    const target = this.require(alias);
+    const selection = this.#entries.get(target.alias)?.presetSelection;
+    if (target.policyMode !== "presets" || selection === undefined) {
+      throw new GatewayError(GATEWAY_ERROR_CODES.commandDenied,
+        "Preset operations require a preset policy on this target", { details: { target: alias } });
+    }
+    const maximumTimeoutMs = Math.min(target.maxTimeoutMs, 15_000);
+    if (requestedTimeoutMs !== undefined && (!Number.isSafeInteger(requestedTimeoutMs) ||
+        requestedTimeoutMs < 1 || requestedTimeoutMs > maximumTimeoutMs)) {
+      throw new GatewayError(GATEWAY_ERROR_CODES.invalidParams,
+        "Requested operation timeout exceeds the target preset policy",
+        { details: { maxTimeoutMs: maximumTimeoutMs } });
+    }
+    return {
+      target,
+      timeoutMs: requestedTimeoutMs ?? maximumTimeoutMs,
+      operation: buildPresetOperation(selection, target.platform, request),
+    };
   }
 
   /** Resolves a target for execution, rejecting unknown and disabled aliases. */
@@ -303,6 +416,10 @@ export class TargetRegistry {
     requestedTimeoutMs?: number,
   ): TransferAuthorization {
     const target = this.require(alias);
+    if (target.policyMode === "presets") {
+      throw new GatewayError(GATEWAY_ERROR_CODES.transferDenied,
+        "File transfer is disabled by the preset policy", { details: { target: alias } });
+    }
     if (target.connectionMode === "tailscale-ssh") {
       throw new GatewayError(GATEWAY_ERROR_CODES.transferDenied, "Tailscale SSH file transfer is not supported yet");
     }

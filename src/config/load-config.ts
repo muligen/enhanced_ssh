@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { parseDocument } from "yaml";
 import { z } from "zod";
+import { permissionPresetSelectionSchema } from "../shared/operation-presets.js";
 
 import { GATEWAY_ERROR_CODES, GatewayError } from "../shared/errors.js";
 import {
@@ -11,6 +12,8 @@ import {
   MAX_RPC_FRAME_BYTES,
   MAX_TIMEOUT_MS,
   targetAliasSchema,
+  targetGroupSchema,
+  targetGroupCatalogSchema,
   targetIdSchema,
   targetPlatformSchema,
 } from "../shared/protocol.js";
@@ -177,10 +180,16 @@ export const fullAccessPolicySchema = z.strictObject({
   maxTimeoutMs: maxTimeoutSchema,
 });
 
+export const presetPolicySchema = permissionPresetSelectionSchema.extend({
+  mode: z.literal("presets"),
+  maxTimeoutMs: maxTimeoutSchema,
+});
+
 export const targetPolicySchema = z.discriminatedUnion("mode", [
   allowListPolicySchema,
   fullAccessPolicySchema,
   denyPolicySchema,
+  presetPolicySchema,
 ]);
 
 export const transferPolicySchema = z.strictObject({
@@ -222,6 +231,7 @@ export const transferPolicySchema = z.strictObject({
 
 export const targetConfigSchema = z.strictObject({
   targetId: targetIdSchema.optional(),
+  group: targetGroupSchema.optional(),
   previousAliases: z
     .array(targetAliasSchema)
     .max(32)
@@ -279,6 +289,13 @@ const targetsSchema = z
     const sshAliases = new Map<string, string>();
     const puttyShares = new Map<string, string>();
     for (const [alias, target] of Object.entries(targets)) {
+      if (target.policy.mode === "presets" && target.transfer.mode !== "deny") {
+        context.addIssue({
+          code: "custom",
+          path: [alias, "transfer", "mode"],
+          message: "Preset policies require disabled file transfer; unrestricted scripts and writes cannot preserve read-only protection",
+        });
+      }
       const foldedSshAlias = target.sshAlias.toLowerCase();
       const sshAliasOwner = sshAliases.get(foldedSshAlias);
       if (sshAliasOwner !== undefined) {
@@ -414,6 +431,7 @@ export const gatewayConfigSchema = z
       })
       .default({ localRoots: {} }),
     targets: targetsSchema,
+    groups: targetGroupCatalogSchema.optional(),
   })
   .superRefine((config, context) => {
     if (config.runtime.inlineOutputBytes > config.runtime.maxStoredOutputBytes) {

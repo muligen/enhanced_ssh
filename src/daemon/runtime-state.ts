@@ -272,7 +272,7 @@ $actualIsDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -
 if ($actualIsDirectory -ne $isDirectory) {
   throw "Private path type changed during ACL hardening"
 }
-$existingAcl = Get-Acl -LiteralPath $targetPath
+$existingAcl = if ($isDirectory) { [System.IO.Directory]::GetAccessControl($targetPath) } else { [System.IO.File]::GetAccessControl($targetPath) }
 $existingOwner = $existingAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 
 $acl = if ($isDirectory) {
@@ -298,7 +298,7 @@ if ($isDirectory) {
   [System.IO.File]::SetAccessControl($targetPath, $acl)
 }
 
-$verifiedAcl = Get-Acl -LiteralPath $targetPath
+$verifiedAcl = if ($isDirectory) { [System.IO.Directory]::GetAccessControl($targetPath) } else { [System.IO.File]::GetAccessControl($targetPath) }
 $verifiedAttributes = [System.IO.File]::GetAttributes($targetPath)
 if (($verifiedAttributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
   throw "Private path became a reparse point during ACL hardening"
@@ -381,6 +381,54 @@ export async function hardenPrivatePaths(
     return;
   }
 
+  await queueWindowsAcl(paths);
+  await Promise.all(
+    snapshots.map(({ specification, entry }) =>
+      assertPrivatePathUnchanged(
+        specification.path,
+        specification.directory,
+        entry.dev,
+        entry.ino,
+      ),
+    ),
+  );
+}
+
+interface PendingAclRequest {
+  readonly paths: readonly PrivatePathSpec[];
+  resolve(): void;
+  reject(error: unknown): void;
+}
+
+let pendingAclRequests: PendingAclRequest[] = [];
+let aclFlushScheduled = false;
+
+// Coalesce concurrent file writes into bounded PowerShell invocations. Every
+// caller still takes and checks its own inode/type snapshot; no ACL result is
+// cached, and failed batches never authorize a caller to publish its files.
+function queueWindowsAcl(paths: readonly PrivatePathSpec[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    pendingAclRequests.push({ paths: paths.map((entry) => ({ ...entry })), resolve, reject });
+    if (!aclFlushScheduled) {
+      aclFlushScheduled = true;
+      setTimeout(() => { void flushWindowsAcl(); }, 5);
+    }
+  });
+}
+
+async function flushWindowsAcl(): Promise<void> {
+  const requests = pendingAclRequests;
+  pendingAclRequests = [];
+  aclFlushScheduled = false;
+  try {
+    await runWindowsAcl(requests.flatMap((request) => request.paths));
+    for (const request of requests) request.resolve();
+  } catch (error) {
+    for (const request of requests) request.reject(error);
+  }
+}
+
+async function runWindowsAcl(paths: readonly PrivatePathSpec[]): Promise<void> {
   const sid = await currentWindowsSid();
   for (const batch of aclBatches(paths)) {
     await execFileAsync(
@@ -397,16 +445,6 @@ export async function hardenPrivatePaths(
       },
     );
   }
-  await Promise.all(
-    snapshots.map(({ specification, entry }) =>
-      assertPrivatePathUnchanged(
-        specification.path,
-        specification.directory,
-        entry.dev,
-        entry.ino,
-      ),
-    ),
-  );
 }
 
 function aclBatches(paths: readonly PrivatePathSpec[]): PrivatePathSpec[][] {

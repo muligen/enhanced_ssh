@@ -14,11 +14,13 @@ import {
 import { isIP } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { stringify } from "yaml";
 import { z } from "zod";
 
 import { parseConfigText } from "../config/load-config.js";
+import { permissionPresetSelectionSchema } from "../shared/operation-presets.js";
 import {
   GatewayReloadCommittedCleanupError,
   startGatewayDaemon,
@@ -34,6 +36,13 @@ import {
   createRpcGatewayFactory,
   type TestUiGatewayFactory,
 } from "./gateway.js";
+import {
+  applyMetadataOverlay,
+  fleetMetadata,
+  isMetadataOnlyFleetChange,
+  managedMetadataOverlaySchema,
+  type ManagedMetadataOverlay,
+} from "./managed-metadata.js";
 import {
   ManagedSshKeyVault,
   ManagedSshKeyVaultError,
@@ -55,6 +64,9 @@ import {
   MAX_INLINE_PREVIEW_BYTES,
   MAX_TIMEOUT_MS,
   targetAliasSchema,
+  targetGroupSchema,
+  targetGroupCatalogSchema,
+  DEFAULT_TARGET_GROUP,
   targetIdSchema,
 } from "../shared/protocol.js";
 
@@ -269,6 +281,7 @@ const managedRemoteRootSchema = z
 
 const managedFleetCommonTargetFields = {
   targetId: targetIdSchema.optional(),
+  group: targetGroupSchema.optional(),
   previousAliases: z.array(targetAliasSchema).max(32).optional(),
   description: managedDescriptionSchema.optional(),
   enabled: z.boolean(),
@@ -322,10 +335,20 @@ const managedFleetDenyTargetSchema = z.strictObject({
   allowedCommands: managedAllowedCommandsSchema.length(0),
 });
 
+const managedFleetPresetTargetSchema = z.strictObject({
+  ...managedFleetTargetFields,
+  policyMode: z.literal("presets"),
+  allowedCommands: managedAllowedCommandsSchema.length(0),
+  permissionPresets: permissionPresetSelectionSchema.shape.presets,
+  logPaths: permissionPresetSelectionSchema.shape.logPaths,
+  logServices: permissionPresetSelectionSchema.shape.logServices,
+});
+
 export const managedFleetTargetSchema = z.discriminatedUnion("policyMode", [
   managedFleetAllowListTargetSchema,
   managedFleetFullAccessTargetSchema,
   managedFleetDenyTargetSchema,
+  managedFleetPresetTargetSchema,
 ]).superRefine((target, context) => {
   const connectionMode = target.connectionMode ?? "openssh";
   if (connectionMode === "accessclient-share") {
@@ -408,11 +431,11 @@ export const managedFleetTargetSchema = z.discriminatedUnion("policyMode", [
   if (target.policyMode === "full-access") {
     return;
   }
-  if (target.policyMode === "deny" && transferMode !== "deny") {
+  if ((target.policyMode === "deny" || target.policyMode === "presets") && transferMode !== "deny") {
     context.addIssue({
       code: "custom",
       path: ["transferMode"],
-      message: "denied access must also deny file transfer",
+      message: "denied or preset access must also deny file transfer",
     });
     return;
   }
@@ -591,6 +614,7 @@ function puttySharingIdentity(
 
 export const managedSshFleetProfileSchema = z.strictObject({
   version: z.literal(3),
+  groups: targetGroupCatalogSchema.optional(),
   accessClient: managedAccessClientSettingsSchema.optional(),
   tailscale: managedTailscaleSettingsSchema.optional(),
   targets: managedFleetTargetsSchema,
@@ -780,6 +804,7 @@ interface ManagedPaths {
   readonly revisions: string;
   readonly keys: string;
   readonly activePointer: string;
+  readonly metadata: string;
   readonly generatedKeyDirectory: string;
   readonly generatedPrivateKey: string;
   readonly generatedPublicKey: string;
@@ -857,6 +882,7 @@ class ManagedSshService implements TestUiConfigurationService {
   #legacyProfile: ManagedSshProfile | undefined;
   #activeRevision: RevisionPaths | undefined;
   #activePointer: ActivePointer | undefined;
+  #metadataOverlay: ManagedMetadataOverlay | undefined;
   #lease: RuntimeLease | undefined;
   #state: ManagedSshState = "unconfigured";
   #lastError: ManagedSshError | undefined;
@@ -1024,6 +1050,17 @@ class ManagedSshService implements TestUiConfigurationService {
           : undefined;
       this.#activeRevision = revision;
       this.#activePointer = selectedPointer;
+      if (validated.fleetProfile !== undefined) {
+        const overlay = await readMetadataOverlay(this.#paths, revision.id);
+        if (overlay !== undefined) {
+          const updated = applyMetadataOverlay(validated.fleetProfile, overlay, revision.id);
+          if (updated !== undefined) {
+            candidateDaemon!.updateMetadata(fleetMetadata(updated));
+            this.#fleetProfile = updated;
+            this.#metadataOverlay = overlay;
+          }
+        }
+      }
       this.#referenceStateTrusted = true;
       if (!hasRunnableConfiguration) {
         // A historical profile cannot be assigned a remote shell safely. Keep
@@ -1297,7 +1334,7 @@ class ManagedSshService implements TestUiConfigurationService {
     }
     await this.applyFleet(
       singleProfileToFleet(validated, targetKey.keyId, bastionKey?.keyId),
-      this.#activeRevision?.id,
+      this.#metadataOverlay?.revision ?? this.#activeRevision?.id,
     );
     return this.#buildStatus();
   }
@@ -1309,12 +1346,12 @@ class ManagedSshService implements TestUiConfigurationService {
     return this.#runExclusive(async () => {
       this.#assertOpen();
       const validated = ensureFleetTargetIdentities(
-        managedSshFleetProfileSchema.parse(profile),
+        normalizeFleetGroups(managedSshFleetProfileSchema.parse(profile)),
         this.#fleetProfile,
       );
       if (
         expectedRevision !== undefined &&
-        expectedRevision !== this.#activeRevision?.id
+        expectedRevision !== (this.#metadataOverlay?.revision ?? this.#activeRevision?.id)
       ) {
         throw publicManagedError(
           "CONFIG_CONFLICT",
@@ -1324,11 +1361,21 @@ class ManagedSshService implements TestUiConfigurationService {
         );
       }
 
+      if (this.#state === "ready" && this.#daemon !== undefined &&
+          this.#activeRevision !== undefined && this.#fleetProfile !== undefined &&
+          isMetadataOnlyFleetChange(this.#fleetProfile, validated)) {
+        if (isDeepStrictEqual(fleetMetadata(this.#fleetProfile), fleetMetadata(validated))) {
+          return this.#buildFleetStatus();
+        }
+        return this.#applyMetadata(validated);
+      }
+
       const staged = await this.#stageRevision(validated);
       const previousFleet = this.#fleetProfile;
       const previousLegacy = this.#legacyProfile;
       const previousRevision = this.#activeRevision;
       const previousPointer = this.#activePointer;
+      const previousMetadata = this.#metadataOverlay;
       const previousState = this.#state;
       const nextPointer: ActivePointer = {
         version: ACTIVE_POINTER_VERSION,
@@ -1400,6 +1447,9 @@ class ManagedSshService implements TestUiConfigurationService {
         this.#legacyProfile = undefined;
         this.#activeRevision = staged.published;
         this.#activePointer = nextPointer;
+        // The old overlay remains bound to the rollback revision. It can never
+        // override a newly committed full configuration, even after a crash.
+        this.#metadataOverlay = undefined;
         this.#state = "ready";
         try {
           await pruneManagedRevisions(this.#paths, [
@@ -1442,6 +1492,7 @@ class ManagedSshService implements TestUiConfigurationService {
           this.#legacyProfile = previousLegacy;
           this.#activeRevision = previousRevision;
           this.#activePointer = previousPointer;
+          this.#metadataOverlay = previousMetadata;
           this.#referenceStateTrusted = true;
           this.#state = previousState;
         } else {
@@ -1452,6 +1503,7 @@ class ManagedSshService implements TestUiConfigurationService {
           this.#state = "error";
           this.#activeRevision = undefined;
           this.#activePointer = undefined;
+          this.#metadataOverlay = undefined;
           this.#referenceStateTrusted = false;
         }
 
@@ -1475,6 +1527,38 @@ class ManagedSshService implements TestUiConfigurationService {
         );
       }
     });
+  }
+
+  async #applyMetadata(profile: ManagedSshFleetProfile): Promise<ManagedSshFleetStatus> {
+    const previous = this.#metadataOverlay;
+    const overlay = managedMetadataOverlaySchema.parse({
+      version: 1,
+      baseRevision: this.#activeRevision!.id,
+      revision: createRevisionId(),
+      ...fleetMetadata(profile),
+    });
+    // Publish one small private file before exposing the new directory to RPC.
+    // No credentials, SSH validation, runtime replacement, or revision pruning.
+    const metadataPath = metadataOverlayPath(this.#paths, overlay.baseRevision);
+    await atomicWritePrivateFile(metadataPath, `${JSON.stringify(overlay)}\n`);
+    try {
+      this.#daemon!.updateMetadata(fleetMetadata(profile));
+    } catch (error) {
+      try {
+        if (previous === undefined) await unlinkIfExists(metadataPath);
+        else await atomicWritePrivateFile(metadataPath, `${JSON.stringify(previous)}\n`);
+      } catch (rollbackError) {
+        this.#state = "error";
+        this.#referenceStateTrusted = false;
+        await this.#daemon?.stop().catch(() => undefined);
+        this.#daemon = undefined;
+        throw publicManagedError("CONFIG_APPLY_FAILED", "Machine metadata could not be restored", rollbackError);
+      }
+      throw publicManagedError("CONFIG_APPLY_FAILED", "Machine metadata was not activated", error);
+    }
+    this.#metadataOverlay = overlay;
+    this.#fleetProfile = profile;
+    return this.#buildFleetStatus();
   }
 
   public async close(): Promise<void> {
@@ -1516,12 +1600,11 @@ class ManagedSshService implements TestUiConfigurationService {
       await mkdir(staging.credentialDirectory, { mode: 0o700 });
       await hardenPrivatePath(staging.credentialDirectory, true);
       const entries = sortedFleetEntries(profile);
-      for (const [alias, target] of entries) {
-        if (usesExternalIdentity(target)) continue;
-        const credentials = fleetCredentialPaths(staging, alias);
-        await mkdir(credentials.root, { mode: 0o700 });
-        await hardenPrivatePath(credentials.root, true);
-      }
+      const credentialDirectories = entries
+        .filter(([, target]) => !usesExternalIdentity(target))
+        .map(([alias]) => fleetCredentialPaths(staging, alias).root);
+      await allSettledOrThrow(credentialDirectories.map((directory) => mkdir(directory, { mode: 0o700 })));
+      await hardenPrivatePaths(credentialDirectories.map((directory) => ({ path: directory, directory: true })));
 
       await allSettledOrThrow(
         entries.flatMap(([alias, target]) => {
@@ -1548,41 +1631,6 @@ class ManagedSshService implements TestUiConfigurationService {
                     credentials.bastionPrivateKey,
                     `${alias} bastion private key`,
                     MAX_PRIVATE_KEY_BYTES,
-                  ),
-                ]),
-          ];
-        }),
-      );
-
-      await allSettledOrThrow(
-        entries.flatMap(([alias, target]) => {
-          if (usesExternalIdentity(target)) return [];
-          const credentials = fleetCredentialPaths(staging, alias);
-          return [
-            validatePrivateKey(
-              this.#sshKeygenExecutable,
-              credentials.targetPrivateKey,
-              `${alias} target private key`,
-            ),
-            verifyKnownHost(
-              this.#sshKeygenExecutable,
-              credentials.knownHosts,
-              target.target.host,
-              target.target.port,
-            ),
-            ...(target.bastion === undefined
-              ? []
-              : [
-                  validatePrivateKey(
-                    this.#sshKeygenExecutable,
-                    credentials.bastionPrivateKey,
-                    `${alias} bastion private key`,
-                  ),
-                  verifyKnownHost(
-                    this.#sshKeygenExecutable,
-                    credentials.knownHosts,
-                    target.bastion.host,
-                    target.bastion.port,
                   ),
                 ]),
           ];
@@ -1619,12 +1667,6 @@ class ManagedSshService implements TestUiConfigurationService {
         writeExclusivePrivateFile(staging.profile, profileSource),
       ]);
 
-      await validateFleetOpenSshConfiguration(
-        this.#sshExecutable,
-        staging.sshConfig,
-        published,
-        managedProfile,
-      );
       await rename(staging.root, published.root);
       stagedDirectory = published.root;
       await hardenPrivatePath(published.root, true);
@@ -1915,7 +1957,7 @@ class ManagedSshService implements TestUiConfigurationService {
       allowedCommands: [...MANAGED_SUPPORTED_COMMANDS],
       ...(this.#activeRevision === undefined
         ? {}
-        : { revision: this.#activeRevision.id }),
+        : { revision: this.#metadataOverlay?.revision ?? this.#activeRevision.id }),
       ...(profile === undefined ? {} : { profile }),
       ...(generatedKey === undefined ? {} : { generatedKey }),
       ...(this.#lastError === undefined
@@ -1940,10 +1982,10 @@ class ManagedSshService implements TestUiConfigurationService {
       keys: keyStatus.keys,
       ...(this.#activeRevision === undefined
         ? {}
-        : { revision: this.#activeRevision.id }),
+        : { revision: this.#metadataOverlay?.revision ?? this.#activeRevision.id }),
       ...(this.#fleetProfile === undefined
         ? {}
-        : { profile: this.#fleetProfile }),
+        : { profile: normalizeFleetGroups(this.#fleetProfile) }),
       ...(this.#lastError === undefined
         ? {}
         : {
@@ -2040,6 +2082,7 @@ function createManagedPaths(directory: string): ManagedPaths {
     revisions: path.join(root, "revisions"),
     keys: path.join(root, "keys"),
     activePointer: path.join(root, "active.json"),
+    metadata: path.join(root, "metadata"),
     generatedKeyDirectory,
     generatedPrivateKey: path.join(generatedKeyDirectory, "agent_ssh_ed25519"),
     generatedPublicKey: path.join(
@@ -2219,12 +2262,27 @@ function ensureFleetTargetIdentities(
   }
   return managedSshFleetProfileSchema.parse({
     version: 3,
+    ...(profile.groups === undefined ? {} : { groups: profile.groups }),
     ...(profile.accessClient === undefined
       ? {}
       : { accessClient: profile.accessClient }),
     ...(profile.tailscale === undefined ? {} : { tailscale: profile.tailscale }),
     targets,
   });
+}
+
+/** Infers legacy membership without changing immutable stored revision rendering. */
+export function normalizeFleetGroups(profile: ManagedSshFleetProfile): ManagedSshFleetProfile {
+  const groups = [...(profile.groups ?? [])];
+  const targets = Object.fromEntries(Object.entries(profile.targets).map(([alias, target]) => {
+    if (target.group === DEFAULT_TARGET_GROUP) {
+      const { group: _group, ...ungrouped } = target;
+      return [alias, ungrouped];
+    }
+    if (target.group !== undefined && !groups.includes(target.group)) groups.push(target.group);
+    return [alias, target];
+  }));
+  return managedSshFleetProfileSchema.parse({ ...profile, groups, targets });
 }
 
 function sameManagedEndpoint(
@@ -2296,6 +2354,7 @@ async function prepareManagedRoot(paths: ManagedPaths): Promise<void> {
   await Promise.all([
     ensurePrivateDirectory(paths.revisions),
     ensurePrivateDirectory(paths.keys),
+    ensurePrivateDirectory(paths.metadata),
     ensurePrivateDirectory(paths.generatedKeyDirectory),
   ]);
 }
@@ -2439,6 +2498,7 @@ function normaliseFleetCredentialPaths(
   }
   return managedSshFleetProfileSchema.parse({
     version: 3,
+    ...(profile.groups === undefined ? {} : { groups: profile.groups }),
     ...(profile.accessClient === undefined
       ? {}
       : { accessClient: profile.accessClient }),
@@ -2517,6 +2577,7 @@ function compatibilityProfile(
   if (
     target === undefined ||
     target.policyMode === "deny" ||
+    target.policyMode === "presets" ||
     usesExternalIdentity(target) ||
     revision === undefined
   ) {
@@ -2705,12 +2766,20 @@ function renderFleetGatewayConfiguration(
             allowedCommands: [...target.allowedCommands],
             maxTimeoutMs: target.maxTimeoutMs,
           }
+        : target.policyMode === "presets" ? {
+            mode: "presets",
+            presets: [...target.permissionPresets],
+            logPaths: [...target.logPaths],
+            logServices: [...target.logServices],
+            maxTimeoutMs: target.maxTimeoutMs,
+          }
         : {
             mode: target.policyMode,
             maxTimeoutMs: target.maxTimeoutMs,
           };
     targets[alias] = {
       ...(target.targetId === undefined ? {} : { targetId: target.targetId }),
+      ...(target.group === undefined ? {} : { group: target.group }),
       ...((target.previousAliases ?? []).length === 0
         ? {}
         : { previousAliases: [...target.previousAliases!] }),
@@ -2767,6 +2836,7 @@ function renderFleetGatewayConfiguration(
   return stringify(
     {
       version: 1,
+      ...(profile.version === 3 && profile.groups !== undefined ? { groups: profile.groups } : {}),
       runtime: {
         dataDirectory: runtimeDirectory,
         inlineOutputBytes,
@@ -3454,6 +3524,25 @@ async function readActivePointer(paths: ManagedPaths): Promise<ActivePointer> {
   return activePointerSchema.parse(JSON.parse(raw) as unknown);
 }
 
+function metadataOverlayPath(paths: ManagedPaths, baseRevision: string): string {
+  if (!REVISION_ID_PATTERN.test(baseRevision)) throw new Error("Invalid metadata base revision");
+  return path.join(paths.metadata, `${baseRevision}.json`);
+}
+
+async function readMetadataOverlay(paths: ManagedPaths, baseRevision: string): Promise<ManagedMetadataOverlay | undefined> {
+  const metadataPath = metadataOverlayPath(paths, baseRevision);
+  try {
+    await assertRegularFile(metadataPath, "machine metadata");
+  } catch (error) {
+    if (error instanceof ManagedSshError && error.code === "FILE_NOT_FOUND") return undefined;
+    throw error;
+  }
+  await hardenPrivatePath(metadataPath, false);
+  const raw = await readFile(metadataPath, "utf8");
+  if (Buffer.byteLength(raw, "utf8") > 4_194_304) throw new Error("Machine metadata is too large");
+  return managedMetadataOverlaySchema.parse(JSON.parse(raw) as unknown);
+}
+
 async function readActivePointerIfPresent(
   paths: ManagedPaths,
 ): Promise<ActivePointer | undefined> {
@@ -3700,6 +3789,19 @@ async function pruneManagedRevisions(
       "CONFIG_INVALID",
       "Managed SSH revision retention could not be enforced",
     );
+  }
+  const remainingRevisions = new Set(remaining);
+  for (const entry of await readdir(paths.metadata, { withFileTypes: true })) {
+    const baseRevision = entry.name.endsWith(".json") ? entry.name.slice(0, -5) : undefined;
+    const temporary = /^r-[a-z0-9]+-[a-f0-9]{32}\.json\.tmp-\d+-[a-f0-9]{32}$/u.test(entry.name);
+    if ((baseRevision === undefined || !REVISION_ID_PATTERN.test(baseRevision)) && !temporary) {
+      throw publicManagedError("CONFIG_INVALID", "Machine metadata storage contains an unexpected entry");
+    }
+    if (temporary || !remainingRevisions.has(baseRevision!)) {
+      const file = path.join(paths.metadata, entry.name);
+      await assertRegularFile(file, "retired machine metadata");
+      await unlink(file);
+    }
   }
 }
 

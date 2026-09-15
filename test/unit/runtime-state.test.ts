@@ -157,6 +157,28 @@ interface AclSnapshot {
   }[];
 }
 
+test("concurrent Windows hardening secures every file and rejects unsafe siblings", {
+  skip: process.platform !== "win32", timeout: 30_000,
+}, async (t) => {
+  const directory = await temporaryDirectory(t);
+  const files = [path.join(directory, "one.txt"), path.join(directory, "two.txt")];
+  await Promise.all(files.map((file) => writeFile(file, "private")));
+  const unsafe = path.join(directory, "linked.txt");
+  await link(files[0]!, unsafe);
+  await assert.rejects(hardenPrivatePath(unsafe, false), /single-link regular file/u);
+  await unlink(unsafe);
+  await Promise.all(files.map((file) => hardenPrivatePath(file, false)));
+  const sid = await windowsUserSid();
+  for (const file of files) {
+    const acl = await readAcl(file);
+    assert.equal(acl.protected, true);
+    assert.equal(acl.owner, sid);
+    assert.deepEqual(acl.rules, [
+      { sid: "S-1-5-18", type: "Allow" }, { sid, type: "Allow" },
+    ].sort((left, right) => left.sid.localeCompare(right.sid)));
+  }
+});
+
 test(
   "Windows hardening removes inherited and unrelated explicit allow ACEs",
   { skip: process.platform !== "win32", timeout: 30_000 },

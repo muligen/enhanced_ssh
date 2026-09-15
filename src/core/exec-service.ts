@@ -38,7 +38,7 @@ import {
   type TargetInfoProbeResult,
 } from "./probe-parser.js";
 import type { MachineIdentityKeyStore } from "./machine-identity.js";
-import type { TargetAuthorization, TargetRegistry } from "./target-registry.js";
+import type { GatewayMetadataUpdate, TargetAuthorization, TargetRegistry } from "./target-registry.js";
 import { GATEWAY_ERROR_CODES, GatewayError } from "../shared/errors.js";
 import type {
   ExecResult,
@@ -63,6 +63,7 @@ import { completeUtf8PrefixLength } from "../shared/utf8.js";
 
 const TARGET_CHECK_COMMAND = "hostname";
 const SAFE_HOSTNAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const MAX_PRESET_OUTPUT_BYTES = 256 * 1024;
 
 type StopReason = "timeout" | "cancel" | "output_limit";
 
@@ -188,6 +189,47 @@ export class ExecService {
 
   public listTargets(): readonly TargetSummary[] {
     return this.#generation.registry.list();
+  }
+
+  public listGroups(): readonly string[] {
+    return this.#generation.registry.listGroups();
+  }
+
+  public listAllowedOperations(target: string) {
+    return this.#generation.registry.listAllowedOperations(target);
+  }
+
+  public runOperation(
+    caller: ExecutionCaller,
+    requestId: RpcId,
+    params: RpcParamsByMethod["operation.run"],
+  ): Promise<ExecResult> {
+    this.#assertExecutionAvailable();
+    const generation = this.#generation;
+    const authorization = generation.registry.authorizeOperation(params.target, {
+      operation: params.operation,
+      parameters: params.parameters,
+    }, params.timeoutMs);
+    const remoteCommand = prepareStructuredRemoteCommand(authorization.target.platform, authorization.operation);
+    // The normal execution path preserves audit durability, cancellation,
+    // concurrency bounds and retained stdout/stderr. Caller scripts never enter it.
+    return this.#startExecution(caller, requestId, authorization.target.alias,
+      authorization, JSON.stringify({ operation: params.operation, parameters: params.parameters }),
+      remoteCommand, generation.executor, undefined, MAX_PRESET_OUTPUT_BYTES).then((execution) => execution.result);
+  }
+
+  public updateMetadata(metadata: GatewayMetadataUpdate): TargetRegistry {
+    if (this.#closing) {
+      throw new ExecServiceReloadError("SERVICE_CLOSING", "Gateway metadata cannot update while the service is stopping");
+    }
+    if (this.#reloadToken !== undefined) {
+      throw new ExecServiceReloadError("RELOAD_IN_PROGRESS", "Gateway configuration reload is already in progress");
+    }
+    const current = this.#generation;
+    const registry = current.registry.withMetadata(metadata);
+    // Active work retains its captured generation; new work reuses the exact same runners.
+    this.#generation = createGeneration(registry, current.executor, current.hostKeyInspector);
+    return registry;
   }
 
   public beginReload(): ExecServiceReloadLease {
@@ -876,6 +918,7 @@ export class ExecService {
     remoteCommand: PreparedRemoteCommand,
     executor: SshRunner,
     observeOutput?: (stream: TaskOutputStream, chunk: Uint8Array) => void,
+    maximumOutputBytes?: number,
   ): Promise<InternalExecutionResult> {
     if (this.#activeCount >= this.#maxConcurrentExecutions) {
       return Promise.reject(
@@ -918,6 +961,7 @@ export class ExecService {
       remoteCommand,
       executor,
       observeOutput,
+      maximumOutputBytes,
     ).finally(() => this.#removeExecution(caller.sessionId, requestId));
     active.done = result.then(
       () => undefined,
@@ -1023,6 +1067,7 @@ export class ExecService {
     remoteCommand: PreparedRemoteCommand,
     executor: SshRunner,
     observeOutput?: (stream: TaskOutputStream, chunk: Uint8Array) => void,
+    maximumOutputBytes?: number,
   ): Promise<InternalExecutionResult> {
     const sink = await this.#outputStore.create(active.executionId);
     let sinkDispositionChosen = false;
@@ -1042,17 +1087,22 @@ export class ExecService {
       );
       let outcome: SshOutcome;
       let termination: ExecResult["termination"];
+      let outputBytes = 0;
       try {
         const outputSink =
-          observeOutput === undefined
+          observeOutput === undefined && maximumOutputBytes === undefined
             ? sink
             : {
                 append: async (
                   stream: TaskOutputStream,
                   chunk: Uint8Array,
                 ): Promise<void> => {
+                  outputBytes += chunk.byteLength;
+                  if (maximumOutputBytes !== undefined && outputBytes > maximumOutputBytes) {
+                    throw new OutputLimitExceededError(maximumOutputBytes, outputBytes - chunk.byteLength, chunk.byteLength);
+                  }
                   await sink.append(stream, chunk);
-                  observeOutput(stream, chunk);
+                  observeOutput?.(stream, chunk);
                 },
               };
         outcome = await executor.run({

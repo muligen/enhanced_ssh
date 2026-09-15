@@ -17,6 +17,9 @@ import { z } from "zod";
 import { GATEWAY_ERROR_CODES } from "../shared/errors.js";
 import {
   MAX_OUTPUT_READ_BYTES,
+  DEFAULT_TARGET_GROUP,
+  targetGroupSchema,
+  targetGroupCatalogSchema,
   dockerPreflightParamsSchema,
   downloadParamsSchema,
   execRunParamsSchema,
@@ -52,6 +55,7 @@ import {
   managedSshKeyLabelSchema,
   managedSshKeyRevisionSchema,
   managedSshFleetProfileSchema,
+  normalizeFleetGroups,
   type CurrentManagedSshProfile,
   type ManagedSshFleetProfile,
   type ManagedSshFleetStatus,
@@ -160,6 +164,13 @@ const adminTargetEnabledRequestSchema = z.strictObject({
   enabled: z.boolean(),
   expectedRevision: managedRevisionSchema,
 });
+const adminGroupRequests = {
+  "/api/admin/group/create": z.strictObject({ name: targetGroupSchema, expectedRevision: managedRevisionSchema.optional() }),
+  "/api/admin/group/rename": z.strictObject({ group: targetGroupSchema, name: targetGroupSchema, expectedRevision: managedRevisionSchema.optional() }),
+  "/api/admin/group/delete": z.strictObject({ group: targetGroupSchema, expectedRevision: managedRevisionSchema.optional() }),
+  "/api/admin/group/move": z.strictObject({ aliases: z.array(targetAliasSchema).min(1).max(1_024).refine((aliases) => new Set(aliases).size === aliases.length, "Aliases must be unique"), group: z.union([targetGroupSchema, z.literal("")]).optional(), expectedRevision: managedRevisionSchema.optional() }),
+  "/api/admin/group/reorder": z.strictObject({ groups: targetGroupCatalogSchema, expectedRevision: managedRevisionSchema.optional() }),
+};
 const adminTailscaleSaveRequestSchema = managedTailscaleSettingsSchema.extend({ expectedRevision: managedRevisionSchema.optional() });
 const adminAccessClientSaveRequestSchema = z.strictObject({
   plinkExecutable: managedAccessClientSettingsSchema.shape.plinkExecutable,
@@ -783,6 +794,7 @@ export async function startTestUiServer(
           const profile = managedSshFleetProfileSchema.parse({
             version: 3,
             ...(current.profile?.accessClient === undefined ? {} : { accessClient: current.profile.accessClient }),
+            groups: normalizeFleetGroups(current.profile ?? { version: 3, targets: {} }).groups,
             tailscale: { executable: tailscaleRequest.executable },
             targets: current.profile?.targets ?? {},
           });
@@ -825,6 +837,7 @@ export async function startTestUiServer(
             accessClient: {
               plinkExecutable: accessClientRequest.plinkExecutable,
             },
+            groups: normalizeFleetGroups(current.profile ?? { version: 3, targets: {} }).groups,
             targets: current.profile?.targets ?? {},
           });
           writeJson(
@@ -962,6 +975,64 @@ export async function startTestUiServer(
         );
         return;
       }
+      case "/api/admin/group/create":
+      case "/api/admin/group/rename":
+      case "/api/admin/group/delete":
+      case "/api/admin/group/move":
+      case "/api/admin/group/reorder": {
+        const groupRequest = adminGroupRequests[route].parse(await readJsonBody(request));
+        const configuration = requireFleetConfigurationService(options);
+        assertConfigurationMutationAvailable(activeRun, configurationMutationActive,
+          accessClientPreparationRequestActive || accessClientPreparationIsActive(options));
+        configurationMutationActive = true;
+        try {
+          const current = await configuration.fleetStatus();
+          assertExpectedRevision(current.revision, groupRequest.expectedRevision);
+          const profile = normalizeFleetGroups(current.profile ?? { version: 3, targets: {} });
+          let groups = [...profile.groups!];
+          const targets = { ...profile.targets };
+          const requireCustomGroup = (name: string): void => {
+            if (name === DEFAULT_TARGET_GROUP) throw new HttpProblem(409, "DEFAULT_GROUP_PROTECTED", "The default group cannot be renamed or deleted");
+            if (!groups.includes(name)) throw new HttpProblem(404, "GROUP_NOT_FOUND", "The group no longer exists");
+          };
+          const requireNewName = (name: string): void => {
+            if (name === DEFAULT_TARGET_GROUP) throw new HttpProblem(409, "DEFAULT_GROUP_PROTECTED", "The default group name is reserved");
+            if (groups.includes(name)) throw new HttpProblem(409, "GROUP_EXISTS", "A group with this name already exists");
+          };
+          const moveTarget = (alias: string, destination: string | undefined): void => {
+            if (!Object.hasOwn(targets, alias)) throw new HttpProblem(404, "TARGET_NOT_FOUND", "A selected target no longer exists");
+            const { group: _oldGroup, ...target } = targets[alias]!;
+            targets[alias] = { ...target, ...(destination === undefined ? {} : { group: destination }) };
+          };
+          if (route === "/api/admin/group/create" && "name" in groupRequest) {
+            requireNewName(groupRequest.name);
+            groups.push(groupRequest.name);
+          } else if (route === "/api/admin/group/rename" && "group" in groupRequest && "name" in groupRequest && typeof groupRequest.name === "string") {
+            const newName = groupRequest.name;
+            requireCustomGroup(groupRequest.group!);
+            if (newName !== groupRequest.group) requireNewName(newName);
+            groups = groups.map((group) => group === groupRequest.group ? newName : group);
+            for (const [alias, target] of Object.entries(targets)) if (target.group === groupRequest.group) moveTarget(alias, newName);
+          } else if (route === "/api/admin/group/delete" && "group" in groupRequest) {
+            requireCustomGroup(groupRequest.group!);
+            groups = groups.filter((group) => group !== groupRequest.group);
+            for (const [alias, target] of Object.entries(targets)) if (target.group === groupRequest.group) moveTarget(alias, undefined);
+          } else if ("aliases" in groupRequest) {
+            const destination = groupRequest.group === "" || groupRequest.group === DEFAULT_TARGET_GROUP ? undefined : groupRequest.group;
+            if (destination !== undefined) requireCustomGroup(destination);
+            for (const alias of groupRequest.aliases) moveTarget(alias, destination);
+          } else if ("groups" in groupRequest) {
+            if (groupRequest.groups.length !== groups.length || groupRequest.groups.some((group) => !groups.includes(group))) {
+              throw new HttpProblem(409, "GROUP_ORDER_INVALID", "Group ordering must contain every custom group exactly once");
+            }
+            groups = groupRequest.groups;
+          }
+          writeJson(response, 200, publicFleetStatus(await configuration.applyFleet(
+            managedSshFleetProfileSchema.parse({ ...profile, groups, targets }), groupRequest.expectedRevision,
+          )));
+        } finally { configurationMutationActive = false; }
+        return;
+      }
       case "/api/admin/target/save": {
         const saveRequest = adminTargetSaveRequestSchema.parse(
           await readJsonBody(request),
@@ -977,6 +1048,11 @@ export async function startTestUiServer(
         try {
           const current = await configuration.fleetStatus();
           assertExpectedRevision(current.revision, saveRequest.expectedRevision);
+          const groups = normalizeFleetGroups(current.profile ?? { version: 3, targets: {} }).groups!;
+          if (saveRequest.target.group === DEFAULT_TARGET_GROUP) delete saveRequest.target.group;
+          if (saveRequest.target.group !== undefined && !groups.includes(saveRequest.target.group)) {
+            throw new HttpProblem(404, "GROUP_NOT_FOUND", "Create the group before assigning a target to it");
+          }
           const targets = { ...(current.profile?.targets ?? {}) };
           const previousAlias = saveRequest.previousAlias;
           let previousTarget: ManagedSshFleetTarget | undefined;
@@ -1052,6 +1128,7 @@ export async function startTestUiServer(
           };
           const profile = managedSshFleetProfileSchema.parse({
             version: 3,
+            groups,
             ...(current.profile?.tailscale === undefined ? {} : { tailscale: current.profile.tailscale }),
             ...(current.profile?.accessClient === undefined
               ? {}
@@ -1099,6 +1176,7 @@ export async function startTestUiServer(
           delete targets[removeRequest.alias];
           const profile = managedSshFleetProfileSchema.parse({
             version: 3,
+            groups: normalizeFleetGroups(current.profile!).groups,
             ...(current.profile?.tailscale === undefined ? {} : { tailscale: current.profile.tailscale }),
             ...(current.profile?.accessClient === undefined
               ? {}
@@ -1156,6 +1234,7 @@ export async function startTestUiServer(
           };
           const profile = managedSshFleetProfileSchema.parse({
             version: 3,
+            groups: normalizeFleetGroups(current.profile!).groups,
             ...(current.profile?.tailscale === undefined ? {} : { tailscale: current.profile.tailscale }),
             ...(current.profile?.accessClient === undefined
               ? {}
@@ -1594,7 +1673,7 @@ function publicFleetStatus(
     ...(status.revision === undefined ? {} : { revision: status.revision }),
     ...(status.profile === undefined
       ? {}
-      : { profile: managedSshFleetProfileSchema.parse(status.profile) }),
+      : { profile: normalizeFleetGroups(managedSshFleetProfileSchema.parse(status.profile)) }),
     ...(status.error === undefined
       ? {}
       : {
@@ -1751,6 +1830,7 @@ async function learnAccessClientHostname(
   }
   const profile = managedSshFleetProfileSchema.parse({
     version: 3,
+    groups: normalizeFleetGroups(current.profile!).groups,
     ...(current.profile?.tailscale === undefined ? {} : { tailscale: current.profile.tailscale }),
     ...(current.profile?.accessClient === undefined
       ? {}

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { operationRequestSchema } from "./operation-presets.js";
 
 import type { GatewayErrorCode } from "./errors.js";
 
@@ -34,7 +35,21 @@ export const targetIdSchema = z
   .string()
   .regex(TARGET_ID_PATTERN, "must be an opaque target ID");
 
+export const targetGroupSchema = z
+  .string()
+  .refine(
+    (value) => !/[\u0000-\u001f\u007f]/u.test(value),
+    "must not contain control characters",
+  )
+  .trim()
+  .min(1)
+  .max(64);
+
 export const targetPlatformSchema = z.enum(["windows", "linux", "macos"]);
+export const DEFAULT_TARGET_GROUP = "默认分组";
+export const targetGroupCatalogSchema = z.array(
+  targetGroupSchema.refine((name) => name !== DEFAULT_TARGET_GROUP, "The default group is reserved"),
+).max(1_024).refine((groups) => new Set(groups).size === groups.length, "Group names must be unique");
 export type TargetPlatform = z.infer<typeof targetPlatformSchema>;
 export const targetConnectionModeSchema = z.enum([
   "openssh",
@@ -84,11 +99,12 @@ const publicDescriptionSchema = z
 export const targetSummarySchema = z.strictObject({
   targetId: targetIdSchema,
   alias: targetAliasSchema,
+  group: targetGroupSchema.optional(),
   description: publicDescriptionSchema.optional(),
   enabled: z.boolean(),
   platform: targetPlatformSchema.default("linux"),
   connectionMode: targetConnectionModeSchema.default("openssh"),
-  policyMode: z.enum(["allow-list", "full-access", "deny"]),
+  policyMode: z.enum(["allow-list", "full-access", "deny", "presets"]),
   transferMode: z
     .enum(["deny", "upload", "download", "bidirectional"])
     .default("deny"),
@@ -101,6 +117,7 @@ export type TargetSummary = z.infer<typeof targetSummarySchema>;
 
 export const targetListResultSchema = z.strictObject({
   targets: z.array(targetSummarySchema).max(1_024),
+  groups: targetGroupCatalogSchema.optional(),
 });
 export type TargetListResult = z.infer<typeof targetListResultSchema>;
 
@@ -737,12 +754,25 @@ export type DockerPreflightResult = z.infer<
   typeof dockerPreflightResultSchema
 >;
 
+export const operationListParamsSchema = z.strictObject({ target: targetAliasSchema });
+export const operationRunParamsSchema = operationRequestSchema.extend({
+  target: targetAliasSchema,
+  timeoutMs: z.number().int().min(1).max(15_000).optional(),
+});
+export const operationListResultSchema = z.strictObject({
+  target: targetAliasSchema,
+  presets: z.array(z.record(z.string(), z.unknown())),
+  operations: z.array(z.record(z.string(), z.unknown())),
+});
+
 export const RPC_METHODS = [
   "session.open",
   "system.ping",
   "target.list",
   "target.check",
   "target.inspect",
+  "operation.list",
+  "operation.run",
   "docker.preflight",
   "exec.run",
   "exec.cancel",
@@ -766,6 +796,8 @@ export const rpcParamsSchemas = {
   "target.list": emptyParamsSchema,
   "target.check": targetCheckParamsSchema,
   "target.inspect": targetInspectParamsSchema,
+  "operation.list": operationListParamsSchema,
+  "operation.run": operationRunParamsSchema,
   "docker.preflight": dockerPreflightParamsSchema,
   "exec.run": execRunParamsSchema,
   "exec.cancel": execCancelParamsSchema,
@@ -786,6 +818,8 @@ export const rpcResultSchemas = {
   "target.list": targetListResultSchema,
   "target.check": targetCheckResultSchema,
   "target.inspect": targetInspectResultSchema,
+  "operation.list": operationListResultSchema,
+  "operation.run": execResultSchema,
   "docker.preflight": dockerPreflightResultSchema,
   "exec.run": execResultSchema,
   "exec.cancel": execCancelResultSchema,

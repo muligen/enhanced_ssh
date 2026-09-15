@@ -273,6 +273,10 @@ export class TransferService {
     this.#generation = freezeGeneration(generation);
   }
 
+  public replaceMetadataRegistry(registry: TargetRegistry): void {
+    this.#generation = freezeGeneration({ ...this.#generation, registry });
+  }
+
   public startUpload(params: UploadParams): TaskStartResult {
     const prepared = this.#prepare(
       params.target,

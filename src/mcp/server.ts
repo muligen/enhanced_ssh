@@ -15,6 +15,9 @@ import {
   outputReadParamsSchema,
   outputReadTextParamsSchema,
   outputTextChunkSchema,
+  operationListParamsSchema,
+  operationListResultSchema,
+  operationRunParamsSchema,
   pingResultSchema,
   targetCheckParamsSchema,
   targetCheckResultSchema,
@@ -34,6 +37,7 @@ import {
 } from "../shared/protocol.js";
 import { GatewayRpcClient } from "../shared/rpc-client.js";
 import { GATEWAY_VERSION } from "../shared/version.js";
+import { registerGroupTools } from "./groups.js";
 
 export type GatewayRpcClientFactory = () => Promise<GatewayRpcClient>;
 
@@ -100,6 +104,23 @@ export function createMcpServer(
     { name: "agent-ssh-mcp", version: GATEWAY_VERSION },
     { capabilities: { tools: {} } },
   );
+  registerGroupTools(server, clientFactory);
+
+  server.registerTool("ssh_list_allowed_operations", {
+    description: "Discover the fixed read-only operations permitted by a target's selected permission presets, including parameter schemas and permitted log resources. Empty operations means none are granted by presets; full-access and legacy targets continue to use ssh_exec.",
+    inputSchema: operationListParamsSchema,
+    outputSchema: operationListResultSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  }, async (params) => toolResult(await withGatewayClient(clientFactory,
+    (client) => client.request("operation.list", params))));
+
+  server.registerTool("ssh_run_operation", {
+    description: "Run one permitted fixed read-only inspection operation. Call ssh_list_allowed_operations first for operation IDs and allowed parameters. No arbitrary shell, script, environment, file writes or Docker changes. Timeout is capped at 15 seconds and the target limit. Results retain stdout/stderr and outputRef pagination.",
+    inputSchema: operationRunParamsSchema,
+    outputSchema: execResultSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false },
+  }, async (params) => toolResult(await withGatewayClient(clientFactory,
+    (client) => client.request("operation.run", params))));
 
   server.registerTool(
     "ssh_gateway_status",

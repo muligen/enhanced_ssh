@@ -1,3 +1,4 @@
+import "./build-ui-motion.mjs";
 import { cp, mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 

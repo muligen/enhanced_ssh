@@ -49,7 +49,15 @@ export class GatewayDispatcher implements RpcDispatcher {
       }
       case "target.list":
         parseRpcParams("target.list", rawParams ?? {});
-        return { targets: [...this.#service.listTargets()] };
+        return { targets: [...this.#service.listTargets()], groups: [...this.#service.listGroups()] };
+      case "operation.list": {
+        const params = parseRpcParams("operation.list", rawParams);
+        return this.#service.listAllowedOperations(params.target);
+      }
+      case "operation.run": {
+        const params = parseRpcParams("operation.run", rawParams);
+        return this.#service.runOperation({ sessionId: context.sessionId }, requestId, params);
+      }
       case "target.check": {
         const params = parseRpcParams("target.check", rawParams);
         return this.#service.check(

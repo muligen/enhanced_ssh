@@ -11,6 +11,7 @@ function registry(): TargetRegistry {
   const config = parseConfigText(
     stringify({
       version: 1,
+      groups: ["Empty", "B 组"],
       runtime: {
         dataDirectory: "C:\\ProgramData\\agent-ssh-gateway",
         inlineOutputBytes: 65_536,
@@ -39,6 +40,7 @@ function registry(): TargetRegistry {
           policy: { mode: "deny", maxTimeoutMs: 10_000 },
         },
         alpha: {
+          group: " A 组 ",
           description: "Allowed host",
           sshAlias: "secret-internal-host",
           enabled: true,
@@ -49,6 +51,7 @@ function registry(): TargetRegistry {
           },
         },
         full: {
+          group: "B 组",
           targetId: "t-11111111111111111111111111111111",
           previousAliases: ["managed-ssh", "old-full"],
           description: "Explicit full access host",
@@ -70,6 +73,11 @@ function hasGatewayCode(code: string): (error: unknown) => boolean {
   return (error: unknown): boolean =>
     error instanceof GatewayError && error.code === code;
 }
+
+test("registry exposes ordered empty catalog groups and infers legacy members", () => {
+  assert.deepEqual(registry().listGroups(), ["Empty", "B 组", "A 组"]);
+  assert.equal(Object.isFrozen(registry().listGroups()), true);
+});
 
 test("list is deterministic, immutable, and does not expose sshAlias", () => {
   const summaries = registry().list();
@@ -137,6 +145,20 @@ test("require rejects unknown, malformed, and disabled aliases", () => {
     () => targets.require("disabled"),
     hasGatewayCode(GATEWAY_ERROR_CODES.targetDisabled),
   );
+});
+
+test("group metadata survives configuration loading and historical target lookup", () => {
+  const targets = registry();
+  assert.deepEqual(
+    targets.list().map(({ alias, group }) => ({ alias, group })),
+    [
+      { alias: "alpha", group: "A 组" },
+      { alias: "disabled", group: undefined },
+      { alias: "full", group: "B 组" },
+    ],
+  );
+  assert.equal(targets.require("managed-ssh").group, "B 组");
+  assert.equal(targets.require("t-11111111111111111111111111111111").group, "B 组");
 });
 
 test("stable IDs and historical aliases resolve without exposing alias history", () => {

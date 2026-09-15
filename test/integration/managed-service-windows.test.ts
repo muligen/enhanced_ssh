@@ -558,6 +558,7 @@ test(
       targets: {
         "linux-a": {
           description: "Linux A",
+          group: "A 组",
           enabled: true,
           target: endpoint,
           knownHostsFile: knownHostsSource,
@@ -568,6 +569,7 @@ test(
         },
         "windows-b": {
           description: "Windows B",
+          group: "B 组",
           enabled: false,
           target: endpoint,
           knownHostsFile: knownHostsSource,
@@ -594,6 +596,8 @@ test(
     );
     const generatedGatewaySource = await readFile(generatedGatewayPath, "utf8");
     const generatedGateway = parseConfigText(generatedGatewaySource);
+    assert.equal(generatedGateway.targets["linux-a"]?.group, "A 组");
+    assert.equal(generatedGateway.targets["windows-b"]?.group, "B 组");
     assert.equal(
       generatedGateway.targets["windows-b"]?.policy.mode,
       "full-access",
@@ -611,6 +615,8 @@ test(
     const reopened = await service.fleetStatus();
     assert.equal(reopened.state, "ready");
     assert.equal(reopened.revision, firstRevision);
+    assert.equal(reopened.profile?.targets["linux-a"]?.group, "A 组");
+    assert.equal(reopened.profile?.targets["windows-b"]?.group, "B 组");
     assert.equal(
       reopened.profile?.targets["windows-b"]?.maxTransferTimeoutMs,
       654_321,
@@ -646,6 +652,7 @@ test(
         {
           alias: "linux-a",
           description: "Linux A",
+          group: "A 组",
           enabled: true,
           platform: "linux",
           connectionMode: "openssh",
@@ -654,10 +661,12 @@ test(
           transferScope: "restricted",
           transferRoots: [],
           maxTimeoutMs: 40_000,
+          maxTransferTimeoutMs: 3_600_000,
         },
         {
           alias: "windows-b",
           description: "Windows B",
+          group: "B 组",
           enabled: false,
           platform: "windows",
           connectionMode: "openssh",
@@ -666,6 +675,7 @@ test(
           transferScope: "all",
           transferRoots: [],
           maxTimeoutMs: 90_000,
+          maxTransferTimeoutMs: 3_600_000,
         },
       ],
     });
@@ -712,6 +722,7 @@ test(
     const secondRevision = secondStatus.revision!;
     assert.notEqual(secondRevision, firstRevision);
     assert.equal(secondStatus.state, "ready");
+    assert.equal(secondStatus.profile?.targets["linux-a"]?.group, "A 组");
     assert.equal(secondStatus.error?.code, "CONFIG_RETENTION_FAILED");
     assert.equal(
       secondStatus.profile?.targets["linux-a"]?.description,
@@ -731,6 +742,7 @@ test(
         {
           alias: "linux-a",
           description: "Linux A retained",
+          group: "A 组",
           enabled: true,
           platform: "linux",
           connectionMode: "openssh",
@@ -739,6 +751,7 @@ test(
           transferScope: "restricted",
           transferRoots: [],
           maxTimeoutMs: 40_000,
+          maxTransferTimeoutMs: 3_600_000,
         },
       ],
     });

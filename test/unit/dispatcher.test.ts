@@ -19,6 +19,15 @@ import {
 
 const context = { sessionId: "dispatcher-test-session" };
 
+test("target.list RPC exposes empty group catalog in configured order", async () => {
+  const service = testExecService({ registry: new TargetRegistry({}, {}, ["B组", "A组"]), executor: new FakeSshExecutor(async () => sshOutcome({ exitCode: 0 })) });
+  const dispatcher = new GatewayDispatcher(service);
+  assert.deepEqual(await dispatcher.dispatch("target.list", {}, context, "groups"), {
+    targets: [], groups: ["B组", "A组"],
+  });
+  await service.shutdown();
+});
+
 test("dispatcher routes strict target.check params through the fixed probe", async () => {
   const executor = new FakeSshExecutor(async (input) => {
     await input.outputSink?.append("stdout", Buffer.from("probe-01\n"));

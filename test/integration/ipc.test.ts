@@ -266,6 +266,7 @@ test("opens an authenticated session and serves ping and target.list RPCs", asyn
   );
   assert.match(listedTargetId, /^t-[a-f0-9]{32}$/u);
   assert.deepEqual(listed.result, {
+    groups: [],
     targets: [
       {
         targetId: listedTargetId,
@@ -279,6 +280,7 @@ test("opens an authenticated session and serves ping and target.list RPCs", asyn
         transferScope: "restricted",
         transferRoots: [],
         maxTimeoutMs: 5_000,
+        maxTransferTimeoutMs: 5_000,
       },
     ],
   });

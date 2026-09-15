@@ -571,6 +571,7 @@ test("admin AccessClient settings survive target save, update, removal, and boot
   const settings = await readObject(settingsResponse);
   assert.deepEqual(configuration.appliedFleets.at(-1), {
     version: 3,
+    groups: [],
     accessClient,
     targets: {},
   });
@@ -580,6 +581,7 @@ test("admin AccessClient settings survive target save, update, removal, and boot
   assert.equal(bootstrap.status, 200);
   assert.deepEqual((await readObject(bootstrap)).profile, {
     version: 3,
+    groups: [],
     accessClient,
     targets: {},
   });
@@ -630,6 +632,7 @@ test("admin AccessClient settings survive target save, update, removal, and boot
   assert.equal(removeResponse.status, 200);
   assert.deepEqual(configuration.fleetProfile, {
     version: 3,
+    groups: [],
     accessClient,
     targets: {},
   });
@@ -2006,6 +2009,71 @@ test("active apply blocks run and key generation", { timeout: 5_000 }, async (t)
 
   finishApply.resolve(readyStatus(profile));
   assert.equal((await applyResponsePromise).status, 200);
+});
+
+test("admin group catalog persists empty groups and preserves machine identities through moves, rename, delete and ordinary saves", async (t) => {
+  const configuration = new FakeConfigurationService();
+  const identity = `t-${"7".repeat(32)}`;
+  configuration.fleetProfile = { version: 3, targets: { alpha: { ...validFleetTarget(), targetId: identity, group: "Legacy" } } };
+  configuration.fleetRevision = `r-original-${"a".repeat(32)}`;
+  const server = await startManagedServer(t, configuration);
+  const mutate = async (route: string, body: Record<string, unknown>) => {
+    const result = await postJson(server, route, { ...body, expectedRevision: configuration.fleetRevision });
+    assert.equal(result.status, 200, await result.clone().text());
+    return readObject(result);
+  };
+  const boot = await readObject(await postJson(server, "/api/admin/bootstrap", {}));
+  assert.deepEqual(requireObject(boot.profile).groups, ["Legacy"]);
+  await mutate("/api/admin/group/create", { name: "Empty" });
+  await mutate("/api/admin/group/create", { name: "Destination" });
+  assert.deepEqual(configuration.fleetProfile!.groups, ["Legacy", "Empty", "Destination"]);
+  await mutate("/api/admin/group/reorder", { groups: ["Empty", "Destination", "Legacy"] });
+  await mutate("/api/admin/group/move", { aliases: ["alpha"], group: "Destination" });
+  assert.equal(configuration.fleetProfile!.targets.alpha!.targetId, identity);
+  assert.equal(configuration.fleetProfile!.targets.alpha!.group, "Destination");
+  await mutate("/api/admin/group/rename", { group: "Destination", name: "Renamed" });
+  assert.equal(configuration.fleetProfile!.targets.alpha!.group, "Renamed");
+  await mutate("/api/admin/target/save", { alias: "alpha", previousAlias: "alpha", target: { ...configuration.fleetProfile!.targets.alpha!, description: "Edited" } });
+  await mutate("/api/admin/target/enabled", { alias: "alpha", enabled: false });
+  await mutate("/api/admin/access-client/save", { plinkExecutable: accessClientExecutablePath() });
+  assert.deepEqual(configuration.fleetProfile!.groups, ["Empty", "Renamed", "Legacy"]);
+  await mutate("/api/admin/group/delete", { group: "Renamed" });
+  assert.deepEqual(configuration.fleetProfile!.groups, ["Empty", "Legacy"]);
+  assert.equal(configuration.fleetProfile!.targets.alpha!.targetId, identity);
+  assert.equal(configuration.fleetProfile!.targets.alpha!.group, undefined);
+  assert.equal(configuration.fleetProfile!.targets.alpha!.description, "Edited");
+  assert.equal(configuration.fleetProfile!.targets.alpha!.enabled, false);
+  await mutate("/api/admin/group/move", { aliases: ["alpha"], group: "默认分组" });
+  await mutate("/api/admin/target/remove", { alias: "alpha" });
+  assert.deepEqual(configuration.fleetProfile!.groups, ["Empty", "Legacy"]);
+  assert.deepEqual(configuration.fleetProfile!.targets, {});
+  assert.ok(configuration.fleetProfile!.accessClient);
+});
+
+test("admin group changes reject stale revisions, reserved names, invalid destinations and partial moves atomically", async (t) => {
+  const configuration = new FakeConfigurationService();
+  const revision = `r-original-${"a".repeat(32)}`;
+  configuration.fleetRevision = revision;
+  configuration.fleetProfile = { version: 3, groups: ["A", "B"], targets: { alpha: { ...validFleetTarget(), group: "A" } } };
+  const server = await startManagedServer(t, configuration);
+  const original = structuredClone(configuration.fleetProfile);
+  const cases: Array<[string, Record<string, unknown>, number, string]> = [
+    ["create", { name: "C", expectedRevision: `r-stale-${"b".repeat(32)}` }, 409, "CONFIG_CONFLICT"],
+    ["create", { name: "默认分组" }, 409, "DEFAULT_GROUP_PROTECTED"],
+    ["rename", { group: "默认分组", name: "C" }, 409, "DEFAULT_GROUP_PROTECTED"],
+    ["delete", { group: "默认分组" }, 409, "DEFAULT_GROUP_PROTECTED"],
+    ["create", { name: "A" }, 409, "GROUP_EXISTS"],
+    ["rename", { group: "A", name: "B" }, 409, "GROUP_EXISTS"],
+    ["move", { aliases: ["alpha"], group: "missing" }, 404, "GROUP_NOT_FOUND"],
+    ["move", { aliases: ["alpha", "missing"], group: "B" }, 404, "TARGET_NOT_FOUND"],
+    ["reorder", { groups: ["A"] }, 409, "GROUP_ORDER_INVALID"],
+  ];
+  for (const [route, body, status, code] of cases) {
+    await assertProblem(await postJson(server, `/api/admin/group/${route}`, { expectedRevision: revision, ...body }), status, code);
+  }
+  await assertProblem(await postJson(server, "/api/admin/target/save", { expectedRevision: revision, previousAlias: "alpha", alias: "alpha", target: { ...validFleetTarget(), group: "missing" } }), 404, "GROUP_NOT_FOUND");
+  assert.deepEqual(configuration.fleetProfile, original);
+  assert.deepEqual(configuration.appliedFleets, []);
 });
 
 function validProfile(): CurrentManagedSshProfile {

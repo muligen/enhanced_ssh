@@ -48,6 +48,7 @@ interface FakeEvent {
 }
 
 class FakeElement {
+  public constructor(public readonly tagName = "DIV") {}
   public textContent = "";
   public className = "";
   public title = "";
@@ -58,6 +59,7 @@ class FakeElement {
   public max = "";
   public placeholder = "";
   public tabIndex = 0;
+  public focusCount = 0;
   public parentNode: FakeElement | null = null;
   public readonly dataset: Record<string, string> = {};
   public readonly classList = new FakeClassList();
@@ -84,12 +86,19 @@ class FakeElement {
 
   public setAttribute(): void {}
   public removeAttribute(): void {}
-  public focus(): void {}
+  public focus(): void { this.focusCount += 1; }
   public select(): void {}
   public setCustomValidity(): void {}
   public reportValidity(): boolean { return true; }
   public matches(): boolean { return false; }
-  public querySelectorAll(): FakeElement[] { return []; }
+  public querySelectorAll(selector: string): FakeElement[] {
+    const matches = (item: FakeElement) => selector.split(",").some((entry) => {
+      const candidate = entry.trim();
+      return candidate.startsWith(".") ? item.className.split(" ").includes(candidate.slice(1)) : item.tagName.toLowerCase() === candidate;
+    });
+    return this.#children.flatMap((child) => [...(matches(child) ? [child] : []), ...child.querySelectorAll(selector)]);
+  }
+  public querySelector(selector: string): FakeElement | null { return this.querySelectorAll(selector)[0] ?? null; }
 
   public append(...children: FakeElement[]): void {
     for (const child of children) {
@@ -109,7 +118,7 @@ class FakeElement {
   }
 }
 
-type NetworkMode = "success" | "invalid-session" | "offline" | "config-error" | "config-error-with-keys" | "key-storage-error" | "key-file-unsafe" | "keys-error" | "orphan-key" | "pending" | "check-unavailable" | "check-host-mismatch" | "prepare-active";
+type NetworkMode = "success" | "invalid-session" | "offline" | "config-error" | "config-error-with-keys" | "key-storage-error" | "key-file-unsafe" | "keys-error" | "orphan-key" | "pending" | "check-unavailable" | "check-host-mismatch" | "prepare-active" | "group-conflict";
 type ClientProfileKind = "tailscale" | "openssh" | "accessclient" | "accessclient-unconfigured";
 
 interface ClientRequest {
@@ -177,15 +186,192 @@ test("machine inventory displays a saved description without creating markup", a
     description,
   });
 
-  const machineItem = requireElement(harness, "machine-list").children[0];
+  const machineItem = requireElement(harness, "machine-list").children.find((item) => item.dataset.alias);
   assert.notEqual(machineItem, undefined);
   const selectButton = machineItem!.children[0];
-  const descriptionElement = selectButton?.children.find(
-    (child) => child.className === "machine-description",
-  );
+  const descriptionElement = selectButton?.querySelector(".machine-description");
   assert.equal(descriptionElement?.textContent, description);
   assert.equal(descriptionElement?.title, description);
   assert.equal(descriptionElement?.children.length, 0);
+});
+
+test("machine groups render safely, filter membership and survive save or removal", async () => {
+  const group = "A组 <b>生产</b>";
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), targetGroups: { alpha: group, beta: "B组", gamma: undefined } });
+  const list = requireElement(harness, "machine-list");
+  const groupLabels = () => list.children.filter((item) => item.className === "machine-group-heading").map((item) => item.querySelector(".machine-group-name")?.textContent);
+  assert.deepEqual(groupLabels(), ["默认分组", group, "B组"]);
+  const groupName = list.children.find((item) => item.dataset.group === group)?.querySelector(".machine-group-name");
+  assert.equal(groupName?.children.length, 0);
+  assert.equal(requireElement(harness, "target-group").value, group);
+  const filter = requireElement(harness, "machine-group-filter");
+  filter.value = "group:B组";
+  filter.dispatch("change");
+  assert.equal(list.children.length, 2);
+  assert.deepEqual(groupLabels(), ["B组"]);
+  filter.value = "ungrouped";
+  filter.dispatch("change");
+  assert.deepEqual(groupLabels(), ["默认分组"]);
+  filter.value = "";
+  filter.dispatch("change");
+  const search = requireElement(harness, "machine-search");
+  search.value = "B组";
+  search.dispatch("input");
+  assert.deepEqual(groupLabels(), ["B组"]);
+  search.value = "";
+  search.dispatch("input");
+  const field = requireElement(harness, "target-group");
+  field.value = " B组 ";
+  requireElement(harness, "machine-form").dispatch("input", field);
+  assert.match(requireElement(harness, "saved-indicator").textContent, /未保存/u);
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const saved = harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as { target: { group?: string } };
+  assert.equal(saved.target.group, "B组");
+  assert.equal(list.children.find((item) => item.dataset.group === "B组")?.querySelector(".group-count")?.textContent, "2");
+  field.value = "";
+  requireElement(harness, "machine-form").dispatch("input", field);
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const cleared = harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as { target: { group?: string } };
+  assert.equal(Object.hasOwn(cleared.target, "group"), false);
+  assert.equal(requireElement(harness, "machine-count").textContent, "3");
+});
+
+test("group directory preserves collapsed choices during search and exposes only existing group options", async () => {
+  const storage = new MemoryStorage();
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage, targetGroups: { alpha: "A组" }, customGroups: ["A组", "空组"] });
+  const list = requireElement(harness, "machine-list");
+  const defaultHeading = list.children.find((item) => item.dataset.group === "");
+  assert.equal(defaultHeading?.children[1]?.className, "group-protected");
+  assert.equal(defaultHeading?.querySelector(".group-count")?.textContent, "0");
+  assert.deepEqual(requireElement(harness, "target-group").children.map((option) => option.value), ["", "A组", "空组"]);
+  const toggle = list.children.find((item) => item.dataset.group === "A组")?.children[0];
+  toggle?.dispatch("click");
+  assert.equal(list.children.find((item) => item.dataset.alias === "alpha")?.hidden, true);
+  const search = requireElement(harness, "machine-search");
+  search.value = "alpha";
+  search.dispatch("input");
+  assert.equal(list.children.find((item) => item.dataset.alias === "alpha")?.hidden, false);
+  search.value = "";
+  search.dispatch("input");
+  assert.equal(list.children.find((item) => item.dataset.alias === "alpha")?.hidden, true);
+  assert.ok(list.children.some((item) => item.dataset.group === "空组"));
+  const reloaded = await startClient({ hash: "", storage, targetGroups: { alpha: "A组" } });
+  assert.equal(requireElement(reloaded, "machine-list").children.find((item) => item.dataset.alias === "alpha")?.hidden, true);
+});
+
+test("group create, move, reorder, rename and delete update inventory without deleting machines", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), targetGroups: { alpha: undefined }, customGroups: ["A组"] });
+  const list = requireElement(harness, "machine-list");
+  const submit = async () => { requireElement(harness, "group-dialog-form").dispatch("submit"); await harness.settle(); };
+  requireElement(harness, "new-group-button").dispatch("click");
+  requireElement(harness, "group-name").value = "B组";
+  await submit();
+  assert.ok(list.children.some((item) => item.dataset.group === "B组"));
+  assert.equal(list.children.find((item) => item.dataset.group === "B组")?.children[0]?.focusCount, 1);
+  const create = harness.requests.find((request) => request.url.endsWith("/admin/group/create"));
+  assert.deepEqual(create?.body, { name: "B组", expectedRevision: `r-test-${"a".repeat(32)}` });
+  list.children.find((item) => item.dataset.alias === "alpha")?.children.find((item) => item.className === "machine-move-button")?.dispatch("click");
+  requireElement(harness, "group-destination").value = "B组";
+  await submit();
+  assert.equal(requireElement(harness, "target-group").value, "B组");
+  list.children.find((item) => item.dataset.group === "B组")?.children[1]?.dispatch("click");
+  requireElement(harness, "group-up-button").dispatch("click");
+  await harness.settle();
+  assert.deepEqual(list.children.filter((item) => item.className === "machine-group-heading").map((item) => item.dataset.group), ["", "B组", "A组"]);
+  list.children.find((item) => item.dataset.group === "B组")?.children[1]?.dispatch("click");
+  requireElement(harness, "group-name").value = "生产组";
+  await submit();
+  assert.equal(requireElement(harness, "target-group").value, "生产组");
+  list.children.find((item) => item.dataset.group === "生产组")?.children[1]?.dispatch("click");
+  requireElement(harness, "group-delete-button").dispatch("click");
+  assert.match(requireElement(harness, "group-dialog-description").textContent, /1 台机器将移到默认分组/u);
+  assert.equal(harness.requests.filter((request) => request.url.endsWith("/admin/group/delete")).length, 0);
+  await submit();
+  assert.equal(requireElement(harness, "target-group").value, "");
+  assert.equal(requireElement(harness, "machine-count").textContent, "1");
+  assert.ok(list.children.some((item) => item.dataset.alias === "alpha"));
+  assert.ok(!list.children.some((item) => item.dataset.group === "生产组"));
+  assert.equal(list.children.find((item) => item.dataset.group === "")?.children[0]?.focusCount, 1);
+});
+
+test("group dialogs preserve unsaved machine forms and reject reserved or duplicate group names", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), targetGroups: { alpha: "A组" } });
+  const description = requireElement(harness, "target-description");
+  description.value = "未保存说明";
+  requireElement(harness, "machine-form").dispatch("input", description);
+  requireElement(harness, "new-group-button").dispatch("click");
+  for (const name of ["默认分组", "A组"]) {
+    requireElement(harness, "group-name").value = name;
+    requireElement(harness, "group-dialog-form").dispatch("submit");
+    await harness.settle();
+    assert.equal(harness.requests.filter((request) => request.url.includes("/admin/group/")).length, 0);
+  }
+  requireElement(harness, "group-name").value = "新组";
+  requireElement(harness, "group-dialog-form").dispatch("submit");
+  await harness.settle();
+  assert.equal(description.value, "未保存说明");
+  const list = requireElement(harness, "machine-list");
+  list.children.find((item) => item.dataset.alias === "alpha")?.children.find((item) => item.className === "machine-move-button")?.dispatch("click");
+  requireElement(harness, "group-destination").value = "新组";
+  requireElement(harness, "group-dialog-form").dispatch("submit");
+  await harness.settle();
+  assert.match(requireElement(harness, "group-dialog-error").textContent, /未保存/u);
+  assert.equal(harness.requests.filter((request) => request.url.endsWith("/admin/group/move")).length, 0);
+  assert.equal(description.value, "未保存说明");
+});
+
+test("an unconfigured inventory can create its first empty group without a revision", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), unconfigured: true });
+  assert.equal(requireElement(harness, "new-group-button").disabled, false);
+  requireElement(harness, "new-group-button").dispatch("click");
+  requireElement(harness, "group-name").value = "新组";
+  requireElement(harness, "group-dialog-form").dispatch("submit");
+  await harness.settle();
+  assert.deepEqual(harness.requests.find((request) => request.url.endsWith("/admin/group/create"))?.body, { name: "新组" });
+  assert.ok(requireElement(harness, "machine-list").children.some((item) => item.dataset.group === "新组"));
+});
+
+test("group conflicts keep inventory intact and failed refresh allows only directory navigation", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), mode: "group-conflict", targetGroups: { alpha: "A组" } });
+  const list = requireElement(harness, "machine-list");
+  list.children.find((item) => item.dataset.group === "A组")?.children[1]?.dispatch("click");
+  requireElement(harness, "group-name").value = "新组";
+  requireElement(harness, "group-dialog-form").dispatch("submit");
+  await harness.settle();
+  assert.match(requireElement(harness, "group-dialog-error").textContent, /配置版本已变化/u);
+  assert.equal(requireElement(harness, "group-submit-button").textContent, "保存名称");
+  assert.equal(requireElement(harness, "group-dialog-status").hidden, true);
+  assert.equal(requireElement(harness, "target-group").value, "A组");
+  assert.equal(requireElement(harness, "machine-count").textContent, "1");
+  requireElement(harness, "group-cancel-button").dispatch("click");
+  harness.setNetworkMode("offline");
+  requireElement(harness, "refresh-button").dispatch("click");
+  await harness.settle();
+  assert.equal(requireElement(harness, "new-group-button").disabled, true);
+  const heading = list.children.find((item) => item.dataset.group === "A组");
+  assert.equal(heading?.children[1]?.disabled, true);
+  assert.equal(heading?.children[0]?.disabled, false);
+  heading?.children[0]?.dispatch("click");
+  assert.equal(list.children.find((item) => item.dataset.alias === "alpha")?.hidden, true);
+});
+
+test("a slow group save displays progress and rejects duplicate submissions", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage() });
+  requireElement(harness, "new-group-button").dispatch("click");
+  requireElement(harness, "group-name").value = "A组";
+  harness.setNetworkMode("pending");
+  requireElement(harness, "group-dialog-form").dispatch("submit");
+  await harness.settle();
+  assert.equal(requireElement(harness, "group-submit-button").textContent, "保存中…");
+  assert.equal(requireElement(harness, "group-submit-button").disabled, true);
+  assert.equal(requireElement(harness, "group-dialog-status").hidden, false);
+  requireElement(harness, "group-dialog-form").dispatch("submit");
+  assert.equal(harness.requests.filter((request) => request.url.endsWith("/admin/group/create")).length, 1);
+  harness.releasePending();
+  await harness.settle();
+  assert.equal(requireElement(harness, "group-dialog-status").hidden, true);
 });
 
 test("the machine list MCP switch applies immediately without overwriting a dirty form", async () => {
@@ -197,7 +383,7 @@ test("the machine list MCP switch applies immediately without overwriting a dirt
   description.value = "尚未保存的新说明";
   requireElement(harness, "machine-form").dispatch("input", description);
 
-  const machineItem = requireElement(harness, "machine-list").children[0]!;
+  const machineItem = requireElement(harness, "machine-list").children.find((item) => item.dataset.alias)!;
   const toggle = machineItem.children.find((child) => child.className === "machine-mcp-toggle");
   assert.notEqual(toggle, undefined);
   assert.equal(toggle!.dataset.enabled, "true");
@@ -213,7 +399,7 @@ test("the machine list MCP switch applies immediately without overwriting a dirt
     expectedRevision: `r-test-${"a".repeat(32)}`,
   });
   assert.equal(description.value, "尚未保存的新说明");
-  assert.match(requireElement(harness, "saved-indicator").textContent, /未保存修改/u);
+  assert.match(requireElement(harness, "saved-indicator").textContent, /未保存/u);
   assert.equal(requireElement(harness, "selected-state-badge").textContent, "已停用");
 
   requireElement(harness, "machine-form").dispatch("submit");
@@ -274,9 +460,9 @@ test("global key generation preserves an unsaved machine and sends only the key 
   assert.equal(harness.elements.has("target-identity-file"), false);
   requireElement(harness, "target-description").value = "尚未保存的说明";
   requireElement(harness, "machine-form").dispatch("input");
-  assert.match(requireElement(harness, "saved-indicator").textContent, /有未保存修改/u);
+  assert.match(requireElement(harness, "saved-indicator").textContent, /未保存/u);
   requireElement(harness, "settings-tab").dispatch("click");
-  assert.match(requireElement(harness, "saved-indicator").textContent, /机器配置有未保存修改/u);
+  assert.match(requireElement(harness, "saved-indicator").textContent, /机器配置未保存/u);
   requireElement(harness, "generate-key-button").dispatch("click");
   requireElement(harness, "key-label").value = "第二把密钥";
   requireElement(harness, "key-editor-form").dispatch("submit");
@@ -291,7 +477,7 @@ test("global key generation preserves an unsaved machine and sends only the key 
   assert.equal(requireElement(harness, "target-description").value, "尚未保存的说明");
   assert.equal(requireElement(harness, "target-key-id").value, KEY_ID);
   assert.equal(requireElement(harness, "key-count").textContent, "2");
-  assert.match(requireElement(harness, "saved-indicator").textContent, /机器配置有未保存修改/u);
+  assert.match(requireElement(harness, "saved-indicator").textContent, /机器配置未保存/u);
 });
 
 test("the OpenSSH first connection guide follows the selected key and platform", async () => {
@@ -576,6 +762,77 @@ test("AccessClient save omits OpenSSH credentials and forces transfer denial", a
   assert.equal(Object.hasOwn(body.target?.target ?? {}, "keyId"), false);
 });
 
+test("AccessClient no-op and metadata saves preserve hidden legacy transport fields", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, profile: "accessclient", storage: new MemoryStorage() });
+  const savedTarget = (fleetProfile(KEY_ID, "accessclient", "C:\\Tools\\plink.exe") as { targets: { alpha: object } }).targets.alpha;
+  const save = async () => {
+    requireElement(harness, "machine-form").dispatch("submit");
+    await harness.settle();
+    return (harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as { target: object }).target;
+  };
+  assert.deepEqual(await save(), savedTarget);
+  requireElement(harness, "target-host").value = "temporary.example.test";
+  requireElement(harness, "machine-form").dispatch("input");
+  requireElement(harness, "target-host").value = "192.0.2.20";
+  requireElement(harness, "machine-form").dispatch("input");
+  assert.deepEqual(await save(), savedTarget);
+  requireElement(harness, "target-description").value = "更新说明";
+  requireElement(harness, "machine-form").dispatch("input");
+  assert.deepEqual(await save(), { ...savedTarget, description: "更新说明" });
+  requireElement(harness, "target-host").value = "192.0.2.99";
+  requireElement(harness, "machine-form").dispatch("input");
+  const changed = await save() as { target: { host: string; username: string }; accessClient: { gatewayHost: string } };
+  assert.equal(changed.target.host, "192.0.2.99");
+  assert.equal(changed.target.username, "portal-user");
+  assert.equal(changed.accessClient.gatewayHost, "192.0.2.99");
+});
+
+test("OpenSSH metadata saves preserve unrendered bastion and optional operational fields", async () => {
+  const hidden = { bastion: { host: "jump.example.test", port: 2222, username: "jump", keyId: SECOND_KEY_ID }, maxTransferTimeoutMs: 600000, targetId: `t-${"c".repeat(32)}`, previousAliases: ["legacy"] };
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), targetPatch: hidden });
+  requireElement(harness, "target-description").value = "Only metadata";
+  requireElement(harness, "machine-form").dispatch("input");
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const body = harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as { target: Record<string, unknown> };
+  const original = (fleetProfile(KEY_ID) as { targets: { alpha: object } }).targets.alpha;
+  assert.deepEqual(body.target, { ...original, ...hidden, description: "Only metadata" });
+});
+
+test("preset controls persist operational changes and block raw command execution", async () => {
+  const patch = { policyMode: "presets", allowedCommands: [], permissionPresets: ["basic-inspection", "docker-protection"], logPaths: [], logServices: [], transferMode: "deny" };
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), targetPatch: patch });
+  assert.equal(requireElement(harness, "preset-fields").hidden, false);
+  assert.equal(requireElement(harness, "run-button").disabled, true);
+  assert.match(requireElement(harness, "command-note").textContent, /ssh_run_operation/u);
+  assert.match(requireElement(harness, "preset-effective").textContent, /Docker 服务与容器变更/u);
+  const presets = harness.inputGroups.get('input[name="permission-preset"]')!;
+  presets.find((input) => input.value === "log-inspection")!.checked = true;
+  requireElement(harness, "preset-log-paths").value = "/var/log/myapp.log";
+  requireElement(harness, "machine-form").dispatch("input");
+  assert.equal(requireElement(harness, "preset-log-fields").hidden, false);
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const saved = harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as { target: Record<string, unknown> };
+  assert.deepEqual(saved.target.permissionPresets, ["basic-inspection", "log-inspection", "docker-protection"]);
+  assert.deepEqual(saved.target.logPaths, ["/var/log/myapp.log"]);
+  assert.equal(saved.target.transferMode, "deny");
+  assert.deepEqual(saved.target.allowedCommands, []);
+});
+
+test("preset metadata saves preserve exact stored permissions and legacy optional fields", async () => {
+  const patch = { policyMode: "presets", allowedCommands: [], permissionPresets: ["docker-protection"], logPaths: [], logServices: [], transferMode: "deny", previousAliases: ["old-alpha"] };
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), targetPatch: patch });
+  assert.match(requireElement(harness, "preset-effective").textContent, /尚未授予任何操作/u);
+  requireElement(harness, "target-description").value = "巡检机器";
+  requireElement(harness, "machine-form").dispatch("input");
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const saved = harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as { target: Record<string, unknown> };
+  const original = (fleetProfile(KEY_ID) as { targets: { alpha: object } }).targets.alpha;
+  assert.deepEqual(saved.target, { ...original, ...patch, description: "巡检机器" });
+});
+
 test("a new AccessClient target saves with only the simplified connection fields", async () => {
   const harness = await startClient({
     hash: `#token=${SESSION_TOKEN}`,
@@ -672,7 +929,7 @@ test("saving Plink keeps a dirty machine form intact", async () => {
     expectedRevision: `r-test-${"a".repeat(32)}`,
   });
   assert.equal(requireElement(harness, "target-description").value, "尚未保存的机器说明");
-  assert.match(requireElement(harness, "saved-indicator").textContent, /有未保存修改/u);
+  assert.match(requireElement(harness, "saved-indicator").textContent, /未保存/u);
 });
 
 test("saving a machine preserves an unsaved Plink path draft", async () => {
@@ -693,7 +950,7 @@ test("saving a machine preserves an unsaved Plink path draft", async () => {
     1,
   );
   assert.equal(requireElement(harness, "plink-executable").value, "C:\\Draft\\plink.exe");
-  assert.match(requireElement(harness, "saved-indicator").textContent, /全局设置有未保存修改/u);
+  assert.match(requireElement(harness, "saved-indicator").textContent, /全局设置未保存/u);
 });
 
 test("a pending Plink save blocks a concurrent machine mutation", async () => {
@@ -849,6 +1106,10 @@ async function startClient(options: {
   readonly mode?: NetworkMode;
   readonly profile?: ClientProfileKind;
   readonly description?: string;
+  readonly targetGroups?: Readonly<Record<string, string | undefined>>;
+  readonly customGroups?: readonly string[];
+  readonly unconfigured?: boolean;
+  readonly targetPatch?: Readonly<Record<string, unknown>>;
 }): Promise<ClientHarness> {
   const source = await readFile(APP_SCRIPT, "utf8");
   const elements = new Map<string, FakeElement>();
@@ -869,8 +1130,8 @@ async function startClient(options: {
     querySelectorAll(selector: string): FakeElement[] {
       return groups.get(selector) ?? [];
     },
-    createElement(): FakeElement {
-      return new FakeElement();
+    createElement(tagName: string): FakeElement {
+      return new FakeElement(tagName.toUpperCase());
     },
     execCommand(): boolean {
       return true;
@@ -897,6 +1158,16 @@ async function startClient(options: {
     plinkExecutable,
     options.description,
   );
+  if (options.targetPatch) {
+    const profile = currentProfile as { targets: Record<string, object> };
+    currentProfile = { ...profile, targets: { ...profile.targets, alpha: { ...profile.targets.alpha, ...options.targetPatch } } };
+  }
+  if (options.targetGroups) {
+    const profile = currentProfile as { targets: Record<string, Record<string, unknown>> };
+    currentProfile = { ...profile, targets: Object.fromEntries(Object.entries(options.targetGroups).map(([alias, group]) => [alias, { ...profile.targets["alpha"], ...(group ? { group } : {}) }])) };
+  }
+  if (options.customGroups) currentProfile = { ...(currentProfile as object), groups: [...options.customGroups] };
+  if (options.unconfigured) currentProfile = { version: 3, targets: {} };
   let accessClientPreparation: Record<string, unknown> = networkMode === "prepare-active"
     ? {
         state: "armed",
@@ -967,6 +1238,7 @@ async function startClient(options: {
       }) as Record<string, unknown>;
       return response(200, {
         ...status,
+        ...(options.unconfigured ? { revision: undefined } : {}),
         accessClientSession: accessClientPreparation,
       });
     }
@@ -991,6 +1263,32 @@ async function startClient(options: {
         error: undefined,
         profile: currentProfile,
       }));
+    }
+    if (_url.includes("/api/admin/group/")) {
+      if (networkMode === "group-conflict") return response(409, { error: { code: "REVISION_CONFLICT", message: "The configuration has changed" } });
+      const action = _url.split("/").at(-1);
+      const request = body as { name?: string; group?: string; aliases?: string[]; groups?: string[] };
+      const profile = currentProfile as { groups?: string[]; targets: Record<string, Record<string, unknown>> };
+      let customGroups = [...new Set([...(profile.groups ?? []), ...Object.values(profile.targets).map((target) => target["group"]).filter((group): group is string => typeof group === "string")])];
+      const targets = Object.fromEntries(Object.entries(profile.targets).map(([alias, target]) => [alias, { ...target }]));
+      if (action === "create") customGroups.push(request.name!);
+      if (action === "rename" || action === "delete") {
+        customGroups = customGroups.flatMap((group) => group !== request.group ? [group] : action === "rename" ? [request.name!] : []);
+        for (const target of Object.values(targets)) {
+          if (target["group"] !== request.group) continue;
+          if (action === "delete") delete target["group"];
+          else target["group"] = request.name;
+        }
+      }
+      if (action === "move") {
+        for (const alias of request.aliases ?? []) {
+          if (request.group) targets[alias]!["group"] = request.group;
+          else delete targets[alias]!["group"];
+        }
+      }
+      if (action === "reorder") customGroups = request.groups!;
+      currentProfile = { ...profile, groups: customGroups, targets };
+      return response(200, fleetStatus({ keyId: KEY_ID, keyRevision, keys, error: undefined, profile: currentProfile }));
     }
     if (_url.endsWith("/api/admin/target/enabled")) {
       const request = body && typeof body === "object"
@@ -1165,7 +1463,8 @@ function createInputGroups(): Map<string, FakeElement[]> {
   return new Map([
     ['input[name="platform"]', [input("windows"), input("linux", true), input("macos")]],
     ['input[name="connection-mode"]', [input("openssh", true), input("accessclient-share"), input("tailscale-ssh")]],
-    ['input[name="policy-mode"]', [input("allow-list", true), input("full-access"), input("deny")]],
+    ['input[name="policy-mode"]', [input("allow-list", true), input("full-access"), input("deny"), input("presets")]],
+    ['input[name="permission-preset"]', [input("basic-inspection"), input("log-inspection"), input("docker-readonly"), input("docker-protection")]],
     ['input[name="transfer-mode"]', [input("deny", true), input("upload"), input("download"), input("bidirectional")]],
     [".operation-tab", [operation("exec"), operation("transfer"), operation("inspect")]],
     ['input[name="execution-format"]', [input("single", true), input("structured")]],
@@ -1317,4 +1616,18 @@ test("Tailscale UI needs no private key and submits a credential-free command-on
   assert.equal(body.target.knownHostsFile, undefined);
   assert.equal(body.target.accessClient, undefined);
   assert.equal(body.target.transferMode, "deny");
+});
+
+
+test("opening a stored public key immediately enables its copy action", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage() });
+  assert.equal(requireElement(harness, "copy-public-key-button").disabled, true);
+  const firstKey = requireElement(harness, "key-list").children[0];
+  assert.ok(firstKey);
+  const publicAction = firstKey.children[1]?.children[0];
+  assert.ok(publicAction);
+  publicAction.dispatch("click");
+  assert.equal(requireElement(harness, "key-public-panel").hidden, false);
+  assert.match(requireElement(harness, "public-key-output").textContent, /^ssh-/u);
+  assert.equal(requireElement(harness, "copy-public-key-button").disabled, false);
 });
