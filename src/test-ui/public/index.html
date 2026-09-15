@@ -78,11 +78,10 @@
 </div>
 </div><div class="section-body">
 <div class="field-grid two-columns">
-<div class="field has-field-help">
-<label for="target-alias">机器别名</label>
-<input autocapitalize="none" autocomplete="off" id="target-alias" maxlength="128" name="target-alias" placeholder="例如 prod-web-01" required="" spellcheck="false" type="text"/>
-
-<details class="field-help"><summary aria-controls="ui-help-1" aria-label="机器别名说明" title="机器别名说明"><svg aria-hidden="true" class="ui-icon" fill="none" focusable="false" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v6M12 7h.01"></path></svg></summary><p class="field-note help-content" id="ui-help-1">用于 Codex 选择机器，仅支持字母、数字、点、下划线和连字符。</p></details></div>
+<div class="field target-host-field">
+<label for="target-host">机器 IP</label>
+<input autocapitalize="none" autocomplete="off" id="target-host" maxlength="45" name="target-host" placeholder="例如 192.168.1.10" required="" spellcheck="false" title="填写 IPv4 或 IPv6 地址，不含协议和端口" type="text"/>
+</div>
 <div class="field">
 <label for="target-description">说明 <span class="optional">可选</span></label>
 <input autocomplete="off" id="target-description" maxlength="256" name="target-description" placeholder="例如 上海生产环境 Web 节点" type="text"/>
@@ -115,10 +114,6 @@
 <label title="Tailnet 身份"><input name="connection-mode" type="radio" value="tailscale-ssh"/><span><svg aria-hidden="true" class="ui-icon" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" viewBox="0 0 24 24"><circle cx="5" cy="5" r="1.5"></circle><circle cx="12" cy="5" r="1.5"></circle><circle cx="19" cy="5" r="1.5"></circle><circle cx="5" cy="12" r="1.5"></circle><circle cx="12" cy="12" r="1.5"></circle><circle cx="19" cy="12" r="1.5"></circle><circle cx="5" cy="19" r="1.5"></circle><circle cx="12" cy="19" r="1.5"></circle><circle cx="19" cy="19" r="1.5"></circle></svg><strong>Tailscale SSH</strong></span></label>
 </div>
 </fieldset>
-<div class="field target-host-field">
-<label for="target-host">目标地址</label>
-<input autocapitalize="none" autocomplete="off" id="target-host" maxlength="253" name="target-host" placeholder="IP 地址或域名" required="" spellcheck="false" type="text"/>
-</div>
 <div id="openssh-connection-fields">
 <div class="field-grid openssh-endpoint-grid">
 <div class="field narrow-field" id="target-port-field">

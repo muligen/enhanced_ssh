@@ -244,7 +244,7 @@ input[aria-invalid="true"], textarea[aria-invalid="true"], select[aria-invalid="
 textarea { min-height: 92px; resize: vertical; }
 select { padding-right: 25px; }
 input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
-.path-input, #target-alias, #target-host, #target-username, #known-hosts-file, #allowed-commands, #remote-roots, #script-input, #environment-input, #command-input, #transfer-checksum, #docker-compose-files, #docker-ports, #key-source-path { font-family: var(--mono); }
+.path-input, #target-host, #target-username, #known-hosts-file, #allowed-commands, #remote-roots, #script-input, #environment-input, #command-input, #transfer-checksum, #docker-compose-files, #docker-ports, #key-source-path { font-family: var(--mono); }
 #target-description { font-size: 12px; }
 #allowed-commands { min-height: 148px; font-size: 13px; line-height: 1.85; }
 #remote-roots, #transfer-excludes { min-height: 90px; }

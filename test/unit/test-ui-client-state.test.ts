@@ -833,6 +833,87 @@ test("preset metadata saves preserve exact stored permissions and legacy optiona
   assert.deepEqual(saved.target, { ...original, ...patch, description: "巡检机器" });
 });
 
+test("a new OpenSSH machine uses its single IP field as the endpoint and generated alias", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage() });
+  requireElement(harness, "new-machine-button").dispatch("click");
+  assert.equal(harness.elements.has("target-alias"), false);
+  assert.equal(requireElement(harness, "target-host").focusCount, 1);
+  requireElement(harness, "target-host").value = "192.0.2.30";
+  requireElement(harness, "target-username").value = "ubuntu";
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const body = harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as {
+    alias: string; previousAlias?: string; target: { target: { host: string } };
+  };
+  assert.ok(body);
+  assert.equal(body.alias, "192.0.2.30");
+  assert.equal(body.target.target.host, "192.0.2.30");
+  assert.equal(body.previousAlias, undefined);
+});
+
+test("a new IPv6 machine generates an SSH-safe alias from its canonical IP", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage() });
+  requireElement(harness, "new-machine-button").dispatch("click");
+  requireElement(harness, "target-host").value = "2001:0DB8:0:0:0:0:0:30";
+  requireElement(harness, "target-username").value = "ubuntu";
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const body = harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as {
+    alias: string; target: { target: { host: string } };
+  };
+  assert.ok(body);
+  assert.equal(body.alias, "ip-2001-db8--30");
+  assert.equal(body.target.target.host, "2001:db8::30");
+});
+
+test("invalid machine IPs are rejected before save without accepting hostnames, URLs or ports", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage() });
+  requireElement(harness, "new-machine-button").dispatch("click");
+  requireElement(harness, "target-username").value = "ubuntu";
+  for (const host of ["", "256.1.2.3", "192.0.2", "192.00.2.30", "server.example.test", "https://192.0.2.30", "192.0.2.30:22", "[2001:db8::30]:22", "2001:::30"]) {
+    requireElement(harness, "target-host").value = host;
+    requireElement(harness, "machine-form").dispatch("submit");
+    await harness.settle();
+    assert.equal(harness.requests.filter((request) => request.url.endsWith("/api/admin/target/save")).length, 0, host);
+    assert.match(requireElement(harness, "form-error").textContent, /IP/u, host);
+  }
+});
+
+test("editing a saved machine IP preserves its existing MCP alias and identity", async () => {
+  const targetId = `t-${"c".repeat(32)}`;
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), targetPatch: { targetId, previousAliases: ["legacy-alpha"] } });
+  requireElement(harness, "target-host").value = "192.0.2.99";
+  requireElement(harness, "machine-form").dispatch("input");
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const body = harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as {
+    alias: string; previousAlias: string; target: { target: { host: string }; targetId?: string; previousAliases?: string[] };
+  };
+  assert.ok(body);
+  assert.equal(body.alias, "alpha");
+  assert.equal(body.previousAlias, "alpha");
+  assert.equal(body.target.target.host, "192.0.2.99");
+  // Identity is preserved by the server's previousAlias lookup, not a newly generated IP alias.
+});
+
+test("unchanged legacy hostnames can still save metadata but edited hostnames must be IPs", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, storage: new MemoryStorage(), profile: "tailscale" });
+  requireElement(harness, "target-description").value = "Build worker";
+  requireElement(harness, "machine-form").dispatch("input");
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  const saved = harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as { alias: string; target: { target: { host: string } } };
+  assert.ok(saved);
+  assert.equal(saved.alias, "alpha");
+  assert.equal(saved.target.target.host, "build");
+  requireElement(harness, "target-host").value = "other-build";
+  requireElement(harness, "machine-form").dispatch("input");
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  assert.equal(harness.requests.filter((request) => request.url.endsWith("/api/admin/target/save")).length, 1);
+  assert.match(requireElement(harness, "form-error").textContent, /IP/u);
+});
+
 test("a new AccessClient target saves with only the simplified connection fields", async () => {
   const harness = await startClient({
     hash: `#token=${SESSION_TOKEN}`,
@@ -844,7 +925,6 @@ test("a new AccessClient target saves with only the simplified connection fields
   const connectionModes = harness.inputGroups.get('input[name="connection-mode"]')!;
   connectionModes[0]!.checked = false;
   connectionModes[1]!.checked = true;
-  requireElement(harness, "target-alias").value = "new-accessclient";
   requireElement(harness, "target-host").value = "192.0.2.30";
   assert.equal(
     requireElement(harness, "accessclient-gateway-username").value,
@@ -858,11 +938,13 @@ test("a new AccessClient target saves with only the simplified connection fields
     .find((candidate) => candidate.url.endsWith("/api/admin/target/save"));
   assert.ok(request);
   const body = request.body as {
+    readonly alias?: string;
     readonly target?: {
       readonly target?: Record<string, unknown>;
       readonly accessClient?: Record<string, unknown>;
     };
   };
+  assert.equal(body.alias, "192.0.2.30");
   assert.deepEqual(body.target?.target, {
     host: "192.0.2.30",
     port: 22,

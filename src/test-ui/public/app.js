@@ -147,7 +147,6 @@ const elements = {
   commandPanel: document.querySelector("#command-panel"),
   settingsPanel: document.querySelector("#settings-panel"),
   machineForm: document.querySelector("#machine-form"),
-  targetAlias: document.querySelector("#target-alias"),
   targetDescription: document.querySelector("#target-description"),
   targetGroup: document.querySelector("#target-group"),
   targetPortField: document.querySelector("#target-port-field"),
@@ -1381,7 +1380,7 @@ function startNewMachine(options = {}) {
   renderCommandTarget();
   renderOutput();
   updateControls();
-  if (state.activeView === "config") elements.targetAlias.focus();
+  if (state.activeView === "config") elements.targetHost.focus();
 }
 
 function createDefaultTarget() {
@@ -1408,12 +1407,12 @@ function fillForm(alias, target) {
   state.hydrating = true;
   clearFormMessages();
   clearInvalidFields();
-  elements.targetAlias.value = alias;
   elements.targetDescription.value = target.description ?? "";
   elements.targetGroup.value = target.group ?? "";
   selectRadio(elements.platformInputs, target.platform);
   selectRadio(elements.connectionModeInputs, target.connectionMode ?? "openssh");
   elements.targetHost.value = target.target.host;
+  elements.targetHost.setCustomValidity("");
   elements.targetPort.value = String(target.target.port);
   elements.accessClientTargetPort.value = String(target.target.port);
   elements.targetUsername.value = target.target.username;
@@ -1453,7 +1452,6 @@ function selectRadio(inputs, value) {
 
 function rawFormSnapshot() {
   return JSON.stringify({
-    alias: elements.targetAlias.value,
     description: elements.targetDescription.value,
     group: elements.targetGroup.value,
     platform: selectedRadio(elements.platformInputs),
@@ -1488,6 +1486,10 @@ function unchangedOperationalForm() {
 function handleFormChange(event) {
   if (state.hydrating) {
     return;
+  }
+  if (event.target === elements.targetHost) {
+    elements.targetHost.setCustomValidity(machineIpError());
+    elements.targetHost.removeAttribute("aria-invalid");
   }
   if (event.target === elements.targetPort) {
     elements.accessClientTargetPort.value = elements.targetPort.value;
@@ -1533,7 +1535,7 @@ function renderConnectionFields() {
   elements.targetKeyField.hidden = tailscale;
   elements.knownHostsField.hidden = tailscale;
   elements.openSshConnectionFields.classList.toggle("tailscale-endpoint", tailscale);
-  elements.targetHost.placeholder = tailscale ? "例如 build-server 或 100.101.102.103" : "IP 地址或域名";
+  elements.targetHost.placeholder = tailscale ? "例如 100.101.102.103" : "例如 192.168.1.10";
   elements.targetUsername.placeholder = tailscale ? "远端系统账号，例如 ubuntu" : "user 或 portal/10.0.0.1/root";
   elements.openSshConnectionFields.hidden = accessClient;
   elements.accessClientConnectionFields.hidden = !accessClient;
@@ -1825,17 +1827,38 @@ function handleWorkspaceTabKeydown(event) {
   setActiveView(enabled[nextIndex].name, true);
 }
 
+function canonicalMachineIp(value) {
+  if (/^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/.test(value)) {
+    return value.split(".").every((part) => Number(part) <= 255) ? value : undefined;
+  }
+  if (!value.includes(":") || !/^[0-9a-fA-F:.]+$/.test(value)) return undefined;
+  try {
+    return new URL(`http://[${value}]/`).hostname.slice(1, -1);
+  } catch {
+    return undefined;
+  }
+}
+
+function machineIpError() {
+  const host = elements.targetHost.value.trim();
+  // Existing hostname-based connections stay editable; new addresses must be IPs.
+  const savedHost = state.originalAlias && state.targets.get(state.originalAlias)?.target.host;
+  return canonicalMachineIp(host) || (savedHost && host === savedHost)
+    ? "" : "请填写有效的 IPv4 或 IPv6 地址，不要包含协议、端口或域名。";
+}
+
 function collectForm(options = {}) {
   clearInvalidFields();
-  const alias = elements.targetAlias.value.trim();
-  if (!ALIAS_PATTERN.test(alias)) {
-    return invalid(elements.targetAlias, "机器别名格式不正确。");
-  }
+  const host = elements.targetHost.value.trim();
+  const ipError = machineIpError();
+  if (ipError) return invalid(elements.targetHost, ipError);
+  const ip = canonicalMachineIp(host);
+  const alias = state.originalAlias ?? (ip.includes(":") ? `ip-${ip.replaceAll(":", "-")}` : ip);
   const duplicate = [...state.targets.keys()].find(
     (candidate) => candidate.toLowerCase() === alias.toLowerCase() && candidate !== state.originalAlias,
   );
   if (duplicate) {
-    return invalid(elements.targetAlias, `机器别名与 ${duplicate} 重复。`);
+    return invalid(elements.targetHost, "该 IP 对应的机器已存在，请在左侧选择已有机器。");
   }
   const description = elements.targetDescription.value.trim();
   const group = elements.targetGroup.value.trim();
@@ -1897,7 +1920,7 @@ function collectForm(options = {}) {
       );
     }
     elements.targetUsername.value = accessClientUsername;
-    const targetHost = elements.targetHost.value.trim();
+    const targetHost = canonicalMachineIp(elements.targetHost.value.trim()) ?? elements.targetHost.value.trim();
     const targetPort = Number(elements.accessClientTargetPort.value);
     const savedExpectedHostname = state.originalAlias === null
       ? undefined
@@ -2026,7 +2049,7 @@ function collectForm(options = {}) {
 }
 
 function collectEndpoint(fields, requireKey = true) {
-  const host = fields.host.value.trim();
+  const host = canonicalMachineIp(fields.host.value.trim()) ?? fields.host.value.trim();
   if (!host) {
     return invalid(fields.host, `请填写${fields.label}地址。`);
   }
