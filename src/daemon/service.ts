@@ -47,6 +47,7 @@ export interface RunningGatewayDaemon {
   activate(): void;
   reload(configPath: string): Promise<void>;
   updateMetadata(metadata: GatewayMetadataUpdate): void;
+  removeTargets(aliases: readonly string[], metadata?: GatewayMetadataUpdate): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -57,7 +58,7 @@ export class GatewayReloadCommittedCleanupError extends Error {
 
   public constructor(cause: unknown) {
     super(
-      "Gateway configuration reload committed, but a retired SSH generation could not be cleaned up",
+      "Gateway configuration update committed, but retired SSH resources could not be cleaned up",
     );
     this.name = "GatewayReloadCommittedCleanupError";
     this.cause = cause;
@@ -112,7 +113,7 @@ async function validateRuntimeDependencies(
 
 interface PreparedGeneration {
   readonly registry: TargetRegistry;
-  readonly executor: SshRunner;
+  readonly executor: RoutingSshExecutor;
   readonly sftp: SftpExecutor;
   readonly hostKeyInspector: TrustedHostKeyInspector;
   readonly generatedSshConfig: GeneratedSshConfig;
@@ -565,6 +566,30 @@ export async function startGatewayDaemon(
         if (reloadOperation === operation) {
           reloadOperation = undefined;
         }
+      };
+      void operation.then(clearOperation, clearOperation);
+      return operation;
+    },
+    removeTargets: (aliases: readonly string[], metadata?: GatewayMetadataUpdate): Promise<void> => {
+      if (stopping !== undefined) {
+        return Promise.reject(new ExecServiceReloadError("SERVICE_CLOSING", "Gateway targets cannot be removed while the service is stopping"));
+      }
+      if (reloadOperation !== undefined) {
+        return Promise.reject(new ExecServiceReloadError("RELOAD_IN_PROGRESS", "Gateway configuration reload is already in progress"));
+      }
+      const operation = (async (): Promise<void> => {
+        const removed = service!.removeTargets(aliases, metadata);
+        transferService!.replaceMetadataRegistry(removed.registry);
+        try {
+          await activeGeneration!.executor.removeRoutes(removed.sshAliases);
+        } catch (error) {
+          // Revocation is committed: persistence must not restore a deleted target.
+          throw new GatewayReloadCommittedCleanupError(error);
+        }
+      })();
+      reloadOperation = operation;
+      const clearOperation = (): void => {
+        if (reloadOperation === operation) reloadOperation = undefined;
       };
       void operation.then(clearOperation, clearOperation);
       return operation;

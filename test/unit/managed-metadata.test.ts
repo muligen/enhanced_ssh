@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { applyMetadataOverlay, fleetMetadata, isMetadataOnlyFleetChange } from "../../src/test-ui/managed-metadata.js";
+import { applyMetadataOverlay, fleetMetadata, isMetadataOnlyFleetChange, isRemovalOnlyFleetChange, overlayRemovedTargets, managedMetadataOverlaySchema } from "../../src/test-ui/managed-metadata.js";
 import type { ManagedSshFleetProfile } from "../../src/test-ui/managed.js";
 
 const baseRevision = `r-base-${"a".repeat(32)}`;
@@ -43,4 +43,36 @@ test("overlay is revision-bound, exact in alias coverage, and rejects operationa
   assert.throws(() => applyMetadataOverlay(profile, { ...overlay, targets: { alpha: { policyMode: "full-access" } } }, baseRevision));
   assert.throws(() => applyMetadataOverlay(profile, { ...overlay, targets: { alpha: { group: "Missing" } } }, baseRevision));
   assert.throws(() => applyMetadataOverlay(profile, { ...overlay, accessClient: {} }, baseRevision));
+});
+
+test("removal fast path permits only a strict subset with unchanged retained settings", () => {
+  const two = { ...profile, targets: { ...profile.targets, beta: profile.targets.alpha! } };
+  assert.equal(isRemovalOnlyFleetChange(two, profile), true);
+  assert.equal(isRemovalOnlyFleetChange(profile, { ...profile, targets: {} }), true);
+  assert.equal(isRemovalOnlyFleetChange(profile, profile), false);
+  assert.equal(isRemovalOnlyFleetChange(two, { ...profile, groups: [] }), false);
+  assert.equal(isRemovalOnlyFleetChange(two, { ...profile, targets: { gamma: profile.targets.alpha! } }), false);
+  assert.equal(isRemovalOnlyFleetChange(two, { ...profile, targets: { alpha: { ...profile.targets.alpha!, enabled: false } } }), false);
+  assert.equal(isRemovalOnlyFleetChange(profile, two), false);
+});
+
+test("explicit revocation overlay cannot reintroduce targets or alter security settings", () => {
+  const revoked = { ...overlay, version: 2, removedTargets: ["alpha"], targets: {} };
+  assert.deepEqual(applyMetadataOverlay(profile, revoked, baseRevision)!.targets, {});
+  assert.deepEqual(overlayRemovedTargets(managedMetadataOverlaySchema.parse(revoked)), ["alpha"]);
+  assert.deepEqual(overlayRemovedTargets(managedMetadataOverlaySchema.parse(overlay)), []);
+  for (const invalid of [
+    { ...revoked, removedTargets: [] },
+    { ...revoked, removedTargets: ["alpha", "alpha"] },
+    { ...revoked, removedTargets: ["missing"] },
+    { ...revoked, targets: overlay.targets },
+    { ...revoked, targets: { extra: {} } },
+    { ...revoked, policyMode: "full-access" },
+    { ...overlay, removedTargets: ["alpha"] },
+  ]) assert.throws(() => applyMetadataOverlay(profile, invalid, baseRevision));
+  const two = { ...profile, targets: { ...profile.targets, beta: profile.targets.alpha! } };
+  const updated = applyMetadataOverlay(two, { ...revoked, targets: { beta: { description: "Kept" } } }, baseRevision)!;
+  assert.deepEqual(Object.keys(updated.targets), ["beta"]);
+  assert.deepEqual(updated.targets.beta!.target, two.targets.beta.target);
+  assert.equal(updated.targets.beta!.description, "Kept");
 });

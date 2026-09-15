@@ -143,6 +143,40 @@ test("retries every distinct close after a transient child failure", async () =>
   );
 });
 
+test("removal revokes routes and OpenSSH fallback aliases without closing surviving sessions", async () => {
+  const fallback = new RecordingRunner(outcome(0, "fallback"));
+  const removed = new RecordingRunner(outcome(0, "removed"));
+  const retained = new RecordingRunner(outcome(0, "retained"));
+  const router = new RoutingSshExecutor(fallback, new Map([["removed", removed], ["retained", retained]]));
+  await router.removeRoutes(["removed", "openssh-removed"]);
+  assert.equal(removed.closeCalls, 1);
+  assert.equal(retained.closeCalls, 0);
+  assert.equal(fallback.closeCalls, 0);
+  for (const sshAlias of ["removed", "openssh-removed"]) {
+    await assert.rejects(router.run({ sshAlias, command: "hostname" }), /target has been removed/iu);
+  }
+  assert.equal((await router.run({ sshAlias: "retained", command: "hostname" })).stdout, "retained");
+  assert.equal((await router.run({ sshAlias: "openssh-retained", command: "hostname" })).stdout, "fallback");
+  await router.close();
+  assert.equal(removed.closeCalls, 1);
+  assert.equal(retained.closeCalls, 1);
+});
+
+test("removal preserves a shared surviving route and retries failed retired cleanup on shutdown", async () => {
+  const fallback = new RecordingRunner(outcome(0, "fallback"));
+  const shared = new RecordingRunner(outcome(0, "shared"));
+  const failing = new RecordingRunner(outcome(0, "failing"), new Error("transient cleanup"));
+  const router = new RoutingSshExecutor(fallback, new Map([["one", shared], ["two", shared], ["failing", failing]]));
+  await router.removeRoutes(["one"]);
+  assert.equal(shared.closeCalls, 0);
+  await assert.rejects(router.removeRoutes(["failing"]), /removed SSH executors failed/iu);
+  await assert.rejects(router.run({ sshAlias: "failing", command: "hostname" }), /removed/iu);
+  assert.equal((await router.run({ sshAlias: "two", command: "hostname" })).stdout, "shared");
+  await router.close();
+  assert.equal(failing.closeCalls, 2);
+  assert.equal(shared.closeCalls, 1);
+});
+
 function outcome(
   exitCode: number,
   stdout: string,

@@ -240,6 +240,14 @@ test(
     assert.deepEqual(await targetAliases(client), ["beta"]);
     assert.deepEqual(await wrapperNames(dataDirectory), secondWrappers);
 
+    await assert.rejects(daemon.removeTargets(["beta"], { targets: { beta: {} } }), /preserve every target/iu);
+    assert.deepEqual(await targetAliases(client), ["beta"]);
+    await daemon.removeTargets(["beta"], { targets: {}, groups: [] });
+    assert.deepEqual(await targetAliases(client), []);
+    assert.deepEqual(await wrapperNames(dataDirectory), secondWrappers);
+    assert.deepEqual(await loadRuntimeDescriptor(dataDirectory), runtimeBefore);
+    daemon.updateMetadata({ targets: {}, groups: ["Empty"] });
+
     client.close();
     client = undefined;
     await daemon.stop();

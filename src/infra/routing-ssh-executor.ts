@@ -7,7 +7,9 @@ import { SshExecutionError } from "./ssh-runner.js";
 
 export class RoutingSshExecutor implements SshRunner {
   readonly #fallback: SshRunner;
-  readonly #routes: ReadonlyMap<string, SshRunner>;
+  readonly #routes: Map<string, SshRunner>;
+  readonly #removedAliases = new Set<string>();
+  readonly #retiredRunners = new Set<SshRunner>();
   #closed = false;
   #closeOperation: Promise<void> | undefined;
 
@@ -23,7 +25,28 @@ export class RoutingSshExecutor implements SshRunner {
     if (this.#closed) {
       return Promise.reject(new SshExecutionError("the SSH executor is closed"));
     }
+    if (this.#removedAliases.has(input.sshAlias)) {
+      return Promise.reject(new SshExecutionError("the SSH target has been removed"));
+    }
     return (this.#routes.get(input.sshAlias) ?? this.#fallback).run(input);
+  }
+
+  public async removeRoutes(aliases: readonly string[]): Promise<void> {
+    for (const alias of aliases) {
+      this.#removedAliases.add(alias);
+      const runner = this.#routes.get(alias);
+      this.#routes.delete(alias);
+      if (runner !== undefined && runner !== this.#fallback) this.#retiredRunners.add(runner);
+    }
+    // A runner shared by a surviving route must remain alive.
+    for (const runner of this.#routes.values()) this.#retiredRunners.delete(runner);
+    const retired = [...this.#retiredRunners];
+    const results = await Promise.allSettled(retired.map(async (runner) => {
+      await runner.close();
+      this.#retiredRunners.delete(runner);
+    }));
+    const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length !== 0) throw new AggregateError(failures, "removed SSH executors failed to close");
   }
 
   public close(): Promise<void> {
@@ -31,7 +54,7 @@ export class RoutingSshExecutor implements SshRunner {
     if (this.#closeOperation !== undefined) return this.#closeOperation;
 
     const operation = closeRunners(
-      new Set([this.#fallback, ...this.#routes.values()]),
+      new Set([this.#fallback, ...this.#routes.values(), ...this.#retiredRunners]),
     );
     this.#closeOperation = operation;
     void operation.catch(() => {

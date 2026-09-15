@@ -211,6 +211,30 @@ export class TargetRegistry {
     return new TargetRegistry(config.targets, config.transfer.localRoots, config.groups);
   }
 
+  /** Only canonical aliases may be removed; validate the entire request before replacing state. */
+  public withoutTargets(aliases: readonly string[]): TargetRegistry {
+    this.#assertRemovableAliases(aliases);
+    const removed = new Set(aliases);
+    return new TargetRegistry(
+      Object.fromEntries(Object.entries(this.#configs).filter(([alias]) => !removed.has(alias))),
+      this.#localRoots,
+      this.#groups,
+    );
+  }
+
+  public sshAliasesForRemoval(aliases: readonly string[]): readonly string[] {
+    // This also accepts disabled targets, unlike execution authorization.
+    this.#assertRemovableAliases(aliases);
+    return [...new Set(aliases.map((alias) => this.#configs[alias]!.sshAlias))];
+  }
+
+  #assertRemovableAliases(aliases: readonly string[]): void {
+    if (!Array.isArray(aliases) || aliases.some((alias) =>
+      typeof alias !== "string" || !TARGET_ALIAS_PATTERN.test(alias) || !Object.hasOwn(this.#configs, alias))) {
+      throw new GatewayError(GATEWAY_ERROR_CODES.configInvalid, "Target removal must name existing canonical aliases");
+    }
+  }
+
   /** Metadata-only replacement: no connection, identity, policy or runner may change. */
   public withMetadata(input: GatewayMetadataUpdate): TargetRegistry {
     const parsed = gatewayMetadataUpdateSchema.safeParse(input);

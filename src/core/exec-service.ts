@@ -232,6 +232,24 @@ export class ExecService {
     return registry;
   }
 
+  /** Revokes an idle subset while preserving all generation resources. */
+  public removeTargets(aliases: readonly string[], metadata?: GatewayMetadataUpdate): {
+    readonly registry: TargetRegistry;
+    readonly sshAliases: readonly string[];
+  } {
+    const lease = this.beginReload();
+    try {
+      const current = this.#generation;
+      const sshAliases = current.registry.sshAliasesForRemoval(aliases);
+      let registry = current.registry.withoutTargets(aliases);
+      if (metadata !== undefined) registry = registry.withMetadata(metadata);
+      lease.commit({ ...current, registry });
+      return { registry, sshAliases };
+    } finally {
+      lease.release();
+    }
+  }
+
   public beginReload(): ExecServiceReloadLease {
     if (this.#closing) {
       throw new ExecServiceReloadError(

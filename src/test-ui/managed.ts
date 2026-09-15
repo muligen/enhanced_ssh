@@ -40,7 +40,9 @@ import {
   applyMetadataOverlay,
   fleetMetadata,
   isMetadataOnlyFleetChange,
+  isRemovalOnlyFleetChange,
   managedMetadataOverlaySchema,
+  overlayRemovedTargets,
   type ManagedMetadataOverlay,
 } from "./managed-metadata.js";
 import {
@@ -1055,7 +1057,9 @@ class ManagedSshService implements TestUiConfigurationService {
         if (overlay !== undefined) {
           const updated = applyMetadataOverlay(validated.fleetProfile, overlay, revision.id);
           if (updated !== undefined) {
-            candidateDaemon!.updateMetadata(fleetMetadata(updated));
+            const removed = overlayRemovedTargets(overlay);
+            if (removed.length > 0) await candidateDaemon!.removeTargets(removed, fleetMetadata(updated));
+            else candidateDaemon!.updateMetadata(fleetMetadata(updated));
             this.#fleetProfile = updated;
             this.#metadataOverlay = overlay;
           }
@@ -1370,6 +1374,13 @@ class ManagedSshService implements TestUiConfigurationService {
         return this.#applyMetadata(validated);
       }
 
+      if (this.#state === "ready" && this.#daemon !== undefined &&
+          this.#activeRevision !== undefined && this.#fleetProfile !== undefined &&
+          isRemovalOnlyFleetChange(this.#fleetProfile, validated)) {
+        return this.#applyMetadata(validated, Object.keys(this.#fleetProfile.targets)
+          .filter((alias) => !Object.hasOwn(validated.targets, alias)));
+      }
+
       const staged = await this.#stageRevision(validated);
       const previousFleet = this.#fleetProfile;
       const previousLegacy = this.#legacyProfile;
@@ -1529,21 +1540,33 @@ class ManagedSshService implements TestUiConfigurationService {
     });
   }
 
-  async #applyMetadata(profile: ManagedSshFleetProfile): Promise<ManagedSshFleetStatus> {
+  async #applyMetadata(profile: ManagedSshFleetProfile, removedTargets: readonly string[] = []): Promise<ManagedSshFleetStatus> {
     const previous = this.#metadataOverlay;
+    const cumulativeRemovals = [...new Set([...overlayRemovedTargets(previous), ...removedTargets])].sort();
     const overlay = managedMetadataOverlaySchema.parse({
-      version: 1,
+      version: cumulativeRemovals.length === 0 ? 1 : 2,
+      ...(cumulativeRemovals.length === 0 ? {} : { removedTargets: cumulativeRemovals }),
       baseRevision: this.#activeRevision!.id,
       revision: createRevisionId(),
       ...fleetMetadata(profile),
     });
     // Publish one small private file before exposing the new directory to RPC.
-    // No credentials, SSH validation, runtime replacement, or revision pruning.
+    // V2 persists explicit revocations against this immutable base. Later metadata
+    // saves retain them, and startup applies them before opening the RPC gate.
     const metadataPath = metadataOverlayPath(this.#paths, overlay.baseRevision);
     await atomicWritePrivateFile(metadataPath, `${JSON.stringify(overlay)}\n`);
     try {
-      this.#daemon!.updateMetadata(fleetMetadata(profile));
+      if (removedTargets.length > 0) await this.#daemon!.removeTargets(removedTargets, fleetMetadata(profile));
+      else this.#daemon!.updateMetadata(fleetMetadata(profile));
     } catch (error) {
+      if (error instanceof GatewayReloadCommittedCleanupError) {
+        // Access is already revoked. Never restore a deleted target merely
+        // because its retired connection could not be cleaned up immediately.
+        this.#metadataOverlay = overlay;
+        this.#fleetProfile = profile;
+        this.#lastError = publicManagedError("CONFIG_RETENTION_FAILED", "Machine removed, but retired connection cleanup is incomplete", error);
+        return this.#buildFleetStatus();
+      }
       try {
         if (previous === undefined) await unlinkIfExists(metadataPath);
         else await atomicWritePrivateFile(metadataPath, `${JSON.stringify(previous)}\n`);
@@ -1554,7 +1577,9 @@ class ManagedSshService implements TestUiConfigurationService {
         this.#daemon = undefined;
         throw publicManagedError("CONFIG_APPLY_FAILED", "Machine metadata could not be restored", rollbackError);
       }
-      throw publicManagedError("CONFIG_APPLY_FAILED", "Machine metadata was not activated", error);
+      const busy = isReloadBusyError(error);
+      throw publicManagedError(busy ? "CONFIG_BUSY" : "CONFIG_APPLY_FAILED",
+        busy ? "SSH configuration cannot change while executions are active" : "Machine directory update was not activated", error, busy ? 409 : 400);
     }
     this.#metadataOverlay = overlay;
     this.#fleetProfile = profile;
@@ -3540,7 +3565,11 @@ async function readMetadataOverlay(paths: ManagedPaths, baseRevision: string): P
   await hardenPrivatePath(metadataPath, false);
   const raw = await readFile(metadataPath, "utf8");
   if (Buffer.byteLength(raw, "utf8") > 4_194_304) throw new Error("Machine metadata is too large");
-  return managedMetadataOverlaySchema.parse(JSON.parse(raw) as unknown);
+  const overlay = managedMetadataOverlaySchema.parse(JSON.parse(raw) as unknown);
+  if (overlay.baseRevision !== baseRevision) {
+    throw new Error("Saved machine directory does not match its base revision");
+  }
+  return overlay;
 }
 
 async function readActivePointerIfPresent(
