@@ -698,6 +698,8 @@ test("an AccessClient target hydrates without OpenSSH fields", async () => {
   assert.equal(requireElement(harness, "openssh-connection-fields").hidden, true);
   assert.equal(requireElement(harness, "accessclient-connection-fields").hidden, false);
   assert.equal(requireElement(harness, "accessclient-target-port").value, "22");
+  assert.equal(requireElement(harness, "accessclient-gateway-host").value, "gateway.example.test");
+  assert.equal(requireElement(harness, "accessclient-gateway-port").value, "2222");
   assert.equal(requireElement(harness, "accessclient-gateway-username").value, "portal-user");
   assert.equal(requireElement(harness, "target-key-id").value, "");
   assert.equal(requireElement(harness, "transfer-deny-note").hidden, true);
@@ -749,11 +751,9 @@ test("AccessClient save omits OpenSSH credentials and forces transfer denial", a
     username: "portal-user",
   });
   assert.deepEqual(body.target?.accessClient, {
-    gatewayHost: "192.0.2.20",
-    gatewayPort: 22,
+    gatewayHost: "gateway.example.test",
+    gatewayPort: 2222,
     gatewayUsername: "portal-user",
-    sharingHost: "192.0.2.20",
-    sharingPort: 22,
     expectedHostname: "access-target",
   });
   assert.equal(body.target?.transferMode, "deny");
@@ -775,6 +775,10 @@ test("AccessClient no-op and metadata saves preserve hidden legacy transport fie
   requireElement(harness, "machine-form").dispatch("input");
   requireElement(harness, "target-host").value = "192.0.2.20";
   requireElement(harness, "machine-form").dispatch("input");
+  requireElement(harness, "accessclient-gateway-host").value = "temporary.example.test";
+  requireElement(harness, "machine-form").dispatch("input");
+  requireElement(harness, "accessclient-gateway-host").value = "gateway.example.test";
+  requireElement(harness, "machine-form").dispatch("input");
   assert.deepEqual(await save(), savedTarget);
   requireElement(harness, "target-description").value = "更新说明";
   requireElement(harness, "machine-form").dispatch("input");
@@ -784,7 +788,7 @@ test("AccessClient no-op and metadata saves preserve hidden legacy transport fie
   const changed = await save() as { target: { host: string; username: string }; accessClient: { gatewayHost: string } };
   assert.equal(changed.target.host, "192.0.2.99");
   assert.equal(changed.target.username, "portal-user");
-  assert.equal(changed.accessClient.gatewayHost, "192.0.2.99");
+  assert.equal(changed.accessClient.gatewayHost, "gateway.example.test");
 });
 
 test("OpenSSH metadata saves preserve unrendered bastion and optional operational fields", async () => {
@@ -914,7 +918,7 @@ test("unchanged legacy hostnames can still save metadata but edited hostnames mu
   assert.match(requireElement(harness, "form-error").textContent, /IP/u);
 });
 
-test("a new AccessClient target saves with only the simplified connection fields", async () => {
+test("a new AccessClient target saves its gateway independently and hydrates it when switching machines", async () => {
   const harness = await startClient({
     hash: `#token=${SESSION_TOKEN}`,
     profile: "accessclient",
@@ -926,6 +930,9 @@ test("a new AccessClient target saves with only the simplified connection fields
   connectionModes[0]!.checked = false;
   connectionModes[1]!.checked = true;
   requireElement(harness, "target-host").value = "192.0.2.30";
+  assert.equal(requireElement(harness, "accessclient-gateway-port").value, "22");
+  requireElement(harness, "accessclient-gateway-host").value = "other-bastion.example.test";
+  requireElement(harness, "accessclient-gateway-port").value = "2223";
   assert.equal(
     requireElement(harness, "accessclient-gateway-username").value,
     "chenzilve",
@@ -951,12 +958,107 @@ test("a new AccessClient target saves with only the simplified connection fields
     username: "chenzilve",
   });
   assert.deepEqual(body.target?.accessClient, {
-    gatewayHost: "192.0.2.30",
-    gatewayPort: 22,
+    gatewayHost: "other-bastion.example.test",
+    gatewayPort: 2223,
     gatewayUsername: "chenzilve",
-    sharingHost: "192.0.2.30",
-    sharingPort: 22,
+    sharingHost: "other-bastion.example.test",
+    sharingPort: 2223,
   });
+  const select = (alias: string) => requireElement(harness, "machine-list").children.find((item) => item.dataset.alias === alias)?.children[0]?.dispatch("click");
+  select("alpha");
+  assert.equal(requireElement(harness, "accessclient-gateway-host").value, "gateway.example.test");
+  assert.equal(requireElement(harness, "accessclient-gateway-port").value, "2222");
+  select("192.0.2.30");
+  assert.equal(requireElement(harness, "accessclient-gateway-host").value, "other-bastion.example.test");
+  assert.equal(requireElement(harness, "accessclient-gateway-port").value, "2223");
+});
+
+test("AccessClient gateway changes replace legacy sharing endpoints and preserve target identity", async () => {
+  const legacyAccessClient = {
+    gatewayHost: "gateway.example.test", gatewayPort: 2222, gatewayUsername: "portal-user",
+    sharingHost: "192.0.2.20", sharingPort: 22, expectedHostname: "access-target",
+  };
+  const harness = await startClient({
+    hash: `#token=${SESSION_TOKEN}`, profile: "accessclient", storage: new MemoryStorage(),
+    targetPatch: { accessClient: legacyAccessClient },
+  });
+  const save = async () => {
+    requireElement(harness, "machine-form").dispatch("submit");
+    await harness.settle();
+    return (harness.requests.findLast((request) => request.url.endsWith("/api/admin/target/save"))?.body as {
+      target: { target: { host: string; port: number }; accessClient: Record<string, unknown> };
+    }).target;
+  };
+  assert.deepEqual((await save()).accessClient, legacyAccessClient);
+  requireElement(harness, "target-description").value = "Updated description";
+  requireElement(harness, "machine-form").dispatch("input");
+  assert.deepEqual((await save()).accessClient, legacyAccessClient);
+  requireElement(harness, "accessclient-gateway-host").value = "second-gateway.example.test";
+  requireElement(harness, "machine-form").dispatch("input");
+  const changedHost = await save();
+  assert.equal(changedHost.target.host, "192.0.2.20");
+  assert.equal(changedHost.target.port, 22);
+  assert.deepEqual(changedHost.accessClient, {
+    ...legacyAccessClient, gatewayHost: "second-gateway.example.test",
+    sharingHost: "second-gateway.example.test", sharingPort: 2222,
+  });
+  requireElement(harness, "accessclient-gateway-port").value = "2200";
+  requireElement(harness, "machine-form").dispatch("input");
+  const changedPort = await save();
+  assert.equal(changedPort.target.port, 22);
+  assert.equal(changedPort.accessClient.gatewayPort, 2200);
+  assert.equal(changedPort.accessClient.sharingPort, 2200);
+  assert.equal(changedPort.accessClient.expectedHostname, "access-target");
+});
+
+test("AccessClient gateway fields reject URL, user, path and invalid port input before saving", async () => {
+  const harness = await startClient({ hash: `#token=${SESSION_TOKEN}`, profile: "accessclient", storage: new MemoryStorage() });
+  const saveRequests = () => harness.requests.filter((request) => request.url.endsWith("/api/admin/target/save"));
+  for (const host of ["", "https://gateway.example.test", "gateway.example.test/path", "user@gateway.example.test", "gateway.example.test:2222", "gateway example.test", "gateway.example.test."]) {
+    requireElement(harness, "accessclient-gateway-host").value = host;
+    requireElement(harness, "machine-form").dispatch("input");
+    requireElement(harness, "machine-form").dispatch("submit");
+    await harness.settle();
+    assert.equal(saveRequests().length, 0, `invalid gateway host was saved: ${host}`);
+    assert.notEqual(requireElement(harness, "form-error").textContent, "");
+  }
+  requireElement(harness, "accessclient-gateway-host").value = "192.0.2.50";
+  for (const port of ["", "0", "65536", "22.5", "abc"]) {
+    requireElement(harness, "accessclient-gateway-port").value = port;
+    requireElement(harness, "machine-form").dispatch("input");
+    requireElement(harness, "machine-form").dispatch("submit");
+    await harness.settle();
+    assert.equal(saveRequests().length, 0, `invalid gateway port was saved: ${port}`);
+  }
+  requireElement(harness, "accessclient-gateway-port").value = "22";
+  requireElement(harness, "machine-form").dispatch("input");
+  requireElement(harness, "machine-form").dispatch("submit");
+  await harness.settle();
+  assert.equal(saveRequests().length, 1);
+  const saved = saveRequests()[0]?.body as { target: { accessClient: { gatewayHost: string } } };
+  assert.equal(saved.target.accessClient.gatewayHost, "192.0.2.50");
+});
+
+test("AccessClient normalizes existing gateway spelling without replacing legacy sharing on timeout edits", async () => {
+  for (const [savedHost, normalizedHost] of [["Gateway.Example.TEST", "gateway.example.test"], ["2001:0DB8:0:0:0:0:0:50", "2001:db8::50"]]) {
+    const accessClient = {
+      gatewayHost: savedHost, gatewayPort: 2222, gatewayUsername: "portal-user",
+      sharingHost: "192.0.2.20", sharingPort: 22, expectedHostname: "access-target",
+    };
+    const harness = await startClient({
+      hash: `#token=${SESSION_TOKEN}`, profile: "accessclient", storage: new MemoryStorage(),
+      targetPatch: { accessClient },
+    });
+    requireElement(harness, "max-timeout-ms").value = "45000";
+    requireElement(harness, "machine-form").dispatch("input");
+    requireElement(harness, "machine-form").dispatch("submit");
+    await harness.settle();
+    const request = harness.requests.findLast((candidate) => candidate.url.endsWith("/api/admin/target/save"));
+    assert.ok(request);
+    const saved = request.body as { target: { maxTimeoutMs: number; accessClient: Record<string, unknown> } };
+    assert.equal(saved.target.maxTimeoutMs, 45000);
+    assert.deepEqual(saved.target.accessClient, { ...accessClient, gatewayHost: normalizedHost });
+  }
 });
 
 test("AccessClient can save when the global key snapshot is unavailable", async () => {

@@ -158,6 +158,8 @@ const elements = {
   targetHost: document.querySelector("#target-host"),
   targetPort: document.querySelector("#target-port"),
   accessClientTargetPort: document.querySelector("#accessclient-target-port"),
+  accessClientGatewayHost: document.querySelector("#accessclient-gateway-host"),
+  accessClientGatewayPort: document.querySelector("#accessclient-gateway-port"),
   targetUsername: document.querySelector("#target-username"),
   targetKeyId: document.querySelector("#target-key-id"),
   targetKeyNote: document.querySelector("#target-key-note"),
@@ -1415,6 +1417,8 @@ function fillForm(alias, target) {
   elements.targetHost.setCustomValidity("");
   elements.targetPort.value = String(target.target.port);
   elements.accessClientTargetPort.value = String(target.target.port);
+  elements.accessClientGatewayHost.value = target.accessClient?.gatewayHost ?? "";
+  elements.accessClientGatewayPort.value = String(target.accessClient?.gatewayPort ?? 22);
   elements.targetUsername.value = target.target.username;
   elements.knownHostsFile.value = target.knownHostsFile ?? "";
   elements.accessClientGatewayUsername.value =
@@ -1459,6 +1463,8 @@ function rawFormSnapshot() {
     host: elements.targetHost.value,
     port: elements.targetPort.value,
     accessClientTargetPort: elements.accessClientTargetPort.value,
+    accessClientGatewayHost: elements.accessClientGatewayHost.value,
+    accessClientGatewayPort: elements.accessClientGatewayPort.value,
     username: elements.targetUsername.value,
     keyId: elements.targetKeyId.value,
     knownHostsFile: elements.knownHostsFile.value,
@@ -1919,18 +1925,31 @@ function collectForm(options = {}) {
         "AccessClient 账号格式不正确。",
       );
     }
+    const rawGatewayHost = elements.accessClientGatewayHost.value.trim();
+    const gatewayHost = canonicalMachineIp(rawGatewayHost) ?? rawGatewayHost.toLowerCase();
+    if (!gatewayHost || gatewayHost.length > 253 || (!canonicalMachineIp(gatewayHost) &&
+      !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/u.test(gatewayHost))) {
+      return invalid(elements.accessClientGatewayHost, "请填写堡垒机域名或 IP，不含协议、路径、账号或端口。");
+    }
+    const gatewayPort = Number(elements.accessClientGatewayPort.value);
+    if (!validInteger(gatewayPort, 1, 65_535)) {
+      return invalid(elements.accessClientGatewayPort, "堡垒机端口必须是 1 至 65535 的整数。");
+    }
     elements.targetUsername.value = accessClientUsername;
-    const targetHost = canonicalMachineIp(elements.targetHost.value.trim()) ?? elements.targetHost.value.trim();
-    const targetPort = Number(elements.accessClientTargetPort.value);
-    const savedExpectedHostname = state.originalAlias === null
-      ? undefined
-      : state.targets.get(state.originalAlias)?.accessClient?.expectedHostname;
+    const savedConnection = savedTarget?.accessClient;
+    const savedGatewayHost = savedConnection && (canonicalMachineIp(savedConnection.gatewayHost) ?? savedConnection.gatewayHost.toLowerCase());
+    const gatewayChanged = !savedConnection || gatewayHost !== savedGatewayHost || gatewayPort !== savedConnection.gatewayPort;
+    const savedExpectedHostname = savedConnection?.expectedHostname;
     accessClient = {
-      gatewayHost: targetHost,
-      gatewayPort: targetPort,
+      gatewayHost,
+      gatewayPort,
       gatewayUsername: accessClientUsername,
-      sharingHost: targetHost,
-      sharingPort: targetPort,
+      ...(gatewayChanged
+        ? { sharingHost: gatewayHost, sharingPort: gatewayPort }
+        : savedConnection.sharingHost === undefined ? {} : {
+          sharingHost: savedConnection.sharingHost,
+          ...(savedConnection.sharingPort === undefined ? {} : { sharingPort: savedConnection.sharingPort }),
+        }),
       ...(savedExpectedHostname === undefined
         ? {}
         : { expectedHostname: savedExpectedHostname }),

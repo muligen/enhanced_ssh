@@ -236,6 +236,8 @@ h3[id] { scroll-margin-top: 98px; }
 .field-grid { display: grid; align-items: start; gap: 18px; min-width: 0; }
 .two-columns { grid-template-columns: repeat(2,minmax(0,1fr)); }
 .openssh-endpoint-grid, .accessclient-primary-grid { grid-template-columns: 105px minmax(0,1fr); }
+.accessclient-primary-grid .accessclient-gateway-field { grid-column: 1 / -1; }
+.accessclient-primary-grid .username-field { grid-column: 1 / -1; }
 input[type="text"], input[type="search"], input[type="number"], input[type="password"], textarea, select { display: block; width: 100%; min-width: 0; min-height: 41px; padding: 10px 12px; border: 1px solid #dde1eb; border-radius: 7px; background: #fff; color: #384055; font-size: 13px; line-height: 1.55; box-shadow: 0 1px 2px #1b213605; }
 input::placeholder, textarea::placeholder { color: #6b6f79; opacity: 1; }
 input:hover:not(:disabled), textarea:hover:not(:disabled), select:hover:not(:disabled) { border-color: #c2c7d7; }

@@ -171,8 +171,16 @@
 </div>
 </div>
 <div class="field-grid accessclient-primary-grid">
+<div class="field accessclient-gateway-field">
+<label for="accessclient-gateway-host">堡垒机地址</label>
+<input autocapitalize="none" autocomplete="off" id="accessclient-gateway-host" maxlength="253" name="accessclient-gateway-host" placeholder="例如 gate.example.com，不含 https://" spellcheck="false" type="text"/>
+</div>
 <div class="field narrow-field">
-<label for="accessclient-target-port">SSH 端口</label>
+<label for="accessclient-gateway-port">堡垒机端口</label>
+<input id="accessclient-gateway-port" inputmode="numeric" max="65535" min="1" name="accessclient-gateway-port" step="1" type="number" value="22"/>
+</div>
+<div class="field narrow-field">
+<label for="accessclient-target-port">机器 SSH 端口</label>
 <input id="accessclient-target-port" inputmode="numeric" max="65535" min="1" name="accessclient-target-port" step="1" type="number" value="22"/>
 </div>
 <div class="field username-field">
