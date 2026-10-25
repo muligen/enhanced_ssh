@@ -1,5 +1,5 @@
 /**
- * SSH Workbench — Liquid selection, v3 (always-on, demand-driven).
+ * SSH Workbench — Liquid selection, v4 (always-on, demand-driven).
  * GSAP Core / Timeline / Performance skills (greensock/gsap-skills).
  * This layer observes committed presentation state. It never calls an API,
  * checks a radio, changes focus, clones labels, or delays a business action.
@@ -123,7 +123,8 @@
       surface.append(light, rim);
       node.append(surface);
       const kind = group.matches('.machine-list') ? 'inventory'
-        : group.matches('.workspace-tabs') ? 'rail'
+        : group.matches('.workspace-tabs') ? 'view'
+        : group.matches('.option-cards') ? 'card'
         : group.matches('.operation-tabs') ? 'tabs' : 'segment';
       node.dataset.motionKind = kind;
       const record = { group, node, surface, light, rim, kind, key: '', layoutKey: '', width: 0, height: 0, wasVisible: false };
@@ -213,10 +214,11 @@
       const dy = y + h / 2 - centerY;
       const horizontal = Math.abs(dx) > Math.abs(dy);
       const distance = Math.hypot(dx, dy);
-      // The larger inventory panel is quieter than the compact capsules.
-      const stretch = kind === 'inventory' ? .045 : kind === 'rail' ? .12 : .17;
+      // Large surfaces (inventory rows, option cards) are quieter than compact capsules;
+      // the view underline stretches like a thin bead of liquid.
+      const stretch = kind === 'inventory' ? .045 : kind === 'card' ? .06 : kind === 'view' ? .14 : .17;
       const travel = kind === 'inventory' ? .48 + clamp(0, .055, distance / 6000)
-        : kind === 'rail' ? .44 + clamp(0, .08, distance / 4500) : .44;
+        : kind === 'card' || kind === 'view' ? .44 + clamp(0, .08, distance / 4500) : .44;
       const axis = horizontal ? 'xPercent' : 'yPercent';
       const direction = Math.sign(horizontal ? dx : dy) || 1;
       const elongate = horizontal
@@ -236,7 +238,7 @@
           .to(surface, { ...settle, duration: travel * .60, ease: 'power2.inOut' }, travel * .28)
           .to(surface, { scaleX: 1, scaleY: 1, duration: .14, ease: 'sine.out' }, travel * .88)
           // A soft moving highlight signals material thickness, not a sparkle loop.
-          .to(light, { opacity: kind === 'inventory' ? .28 : .60, duration: travel * .23, ease: 'sine.out' }, 0)
+          .to(light, { opacity: kind === 'inventory' ? .28 : kind === 'card' ? .45 : .60, duration: travel * .23, ease: 'sine.out' }, 0)
           .to(light, { [axis]: direction * 75, duration: travel, ease: 'sine.inOut' }, 0)
           .to(light, { opacity: 0, duration: travel * .47, ease: 'sine.out' }, travel * .53);
         // The rim stays static. One moving light already communicates the glass;
@@ -399,7 +401,7 @@
   document.addEventListener('keydown', closeHelp);
   window.SSHMotion = Object.freeze({
     get version() { return gsap.version; },
-    get design() { return 'liquid-selection-v3'; },
+    get design() { return 'liquid-selection-v4'; },
     get motionPolicy() { return 'always'; },
     get mode() { return currentMode; },
     get activeAnimations() { return activeCount(); },
