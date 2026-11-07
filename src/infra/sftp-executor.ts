@@ -3,7 +3,11 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import type { Readable } from "node:stream";
 
-import type { OutputSink, OutputStream } from "./openssh-executor.js";
+import type {
+  OutputSink,
+  OutputStream,
+  SshControlPathProvider,
+} from "./openssh-executor.js";
 import {
   MAX_MANAGED_STDIN_BYTES,
   spawnManagedProcess,
@@ -25,6 +29,8 @@ export interface SftpExecutorOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly windowsSupervisorPath?: string;
   readonly allowUnsafeProcessTermination?: boolean;
+  /** Optional per-generation pool of shared connections to reuse. */
+  readonly controlMasters?: SshControlPathProvider;
 }
 
 export interface SftpExecutorDependencies {
@@ -112,10 +118,17 @@ export class SftpExecutor {
     if (isSignalAborted(input.signal)) {
       return emptyAbortedOutcome(performance.now() - startedAt);
     }
+    const controlPath = await this.#options.controlMasters?.acquire(
+      input.sshAlias,
+      input.signal,
+    );
+    if (isSignalAborted(input.signal)) {
+      return emptyAbortedOutcome(performance.now() - startedAt);
+    }
 
     const managedOptions: ManagedProcessOptions = {
       executable: this.#options.executable,
-      arguments: buildOpenSftpArguments(this.#options, input),
+      arguments: buildOpenSftpArguments(this.#options, input, controlPath),
       stdinPayload: batch,
       ...(this.#options.cwd === undefined ? {} : { cwd: this.#options.cwd }),
       ...(this.#options.environment === undefined
@@ -248,9 +261,16 @@ export function buildOpenSftpArguments(
     | "connectTimeoutSeconds"
   >,
   input: Pick<SftpRunInput, "sshAlias" | "batch">,
+  controlPath?: string,
 ): string[] {
   validateRequiredPaths(options);
   validateRunInput(input);
+  if (
+    controlPath !== undefined &&
+    (controlPath.length === 0 || controlPath === "none" || /[\0\r\n%~$\s]/u.test(controlPath))
+  ) {
+    throw new TypeError("controlPath must be a literal path without OpenSSH expansions or whitespace");
+  }
   const connectTimeout =
     options.connectTimeoutSeconds ?? DEFAULT_CONNECT_TIMEOUT_SECONDS;
   validateConnectTimeout(connectTimeout);
@@ -310,8 +330,10 @@ export function buildOpenSftpArguments(
     "ControlMaster=no",
     "-o",
     "ControlPersist=no",
+    // ControlMaster=no keeps this a client: a missing master means a direct
+    // connection, never a new master owned by this SFTP process group.
     "-o",
-    "ControlPath=none",
+    `ControlPath=${controlPath ?? "none"}`,
     "-o",
     "EscapeChar=none",
     "-o",

@@ -49,39 +49,21 @@ export async function executeManagedCommand(
   validateManagedCommandOptions(options);
   validateManagedCommandInput(input);
   const startedAt = performance.now();
-  const captureLimit =
-    input.maxCapturedOutputBytes ??
-    options.maxCapturedOutputBytes ??
-    DEFAULT_CAPTURE_BYTES;
-  validateByteLimit(captureLimit, "maxCapturedOutputBytes");
+  const captureLimit = resolveCaptureLimit(options, input);
 
   if (isSignalAborted(input.signal)) {
     return emptyAbortedOutcome(performance.now() - startedAt);
   }
 
-  const managedOptions: ManagedProcessOptions = {
-    executable: options.executable,
-    arguments: input.arguments,
-    ...(input.stdin === undefined ? {} : { stdinPayload: Buffer.from(input.stdin) }),
-    ...(input.signal === undefined ? {} : { signal: input.signal }),
-    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-    ...(options.environment === undefined
-      ? {}
-      : { environment: options.environment }),
-    ...(options.windowsSupervisorPath === undefined
-      ? {}
-      : { windowsSupervisorPath: options.windowsSupervisorPath }),
-    ...(options.allowUnsafeProcessTermination === undefined
-      ? {}
-      : {
-          allowUnsafeProcessTermination: options.allowUnsafeProcessTermination,
-        }),
-  };
-
   let managed: ManagedProcess;
   try {
     managed = await (dependencies.spawnProcess ?? spawnManagedProcess)(
-      managedOptions,
+      managedProcessOptions(options, input.arguments, {
+        ...(input.stdin === undefined
+          ? {}
+          : { stdinPayload: Buffer.from(input.stdin) }),
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+      }),
     );
   } catch (error: unknown) {
     if (error instanceof ProcessTreeAbortError) {
@@ -92,6 +74,56 @@ export async function executeManagedCommand(
     });
   }
 
+  return superviseManagedProcess(managed, input, captureLimit, startedAt);
+}
+
+/**
+ * Spawns a managed process whose standard input stays open, so that
+ * {@link executePrestartedCommand} can deliver the input later.
+ */
+export async function spawnPrestartedProcess(
+  options: ManagedCommandOptions,
+  arguments_: readonly string[],
+  dependencies: ManagedCommandDependencies = {},
+): Promise<ManagedProcess> {
+  validateManagedCommandOptions(options);
+  validateManagedCommandInput({ arguments: arguments_ });
+  const managed = await (dependencies.spawnProcess ?? spawnManagedProcess)(
+    managedProcessOptions(options, arguments_, { streamStdin: true }),
+  );
+  // Writing to a process that already exited fails with EPIPE; the run then
+  // reports that process's own exit status instead.
+  managed.child.stdin.on("error", () => undefined);
+  return managed;
+}
+
+/**
+ * Delivers standard input to a process from {@link spawnPrestartedProcess}
+ * and supervises it exactly like {@link executeManagedCommand}. Output the
+ * process wrote while waiting is still in its pipes and belongs to this run.
+ */
+export async function executePrestartedCommand(
+  managed: ManagedProcess,
+  options: Pick<ManagedCommandOptions, "maxCapturedOutputBytes">,
+  input: Omit<ManagedCommandInput, "arguments">,
+): Promise<SshOutcome> {
+  validateManagedCommandInput({ ...input, arguments: [] });
+  const startedAt = performance.now();
+  const captureLimit = resolveCaptureLimit(options, input);
+
+  // An aborted run never receives its input; supervision terminates it.
+  if (!isSignalAborted(input.signal)) {
+    managed.child.stdin.end(Buffer.from(input.stdin ?? new Uint8Array()));
+  }
+  return superviseManagedProcess(managed, input, captureLimit, startedAt);
+}
+
+async function superviseManagedProcess(
+  managed: ManagedProcess,
+  input: Pick<ManagedCommandInput, "signal" | "outputSink">,
+  captureLimit: number,
+  startedAt: number,
+): Promise<SshOutcome> {
   const { child } = managed;
   let closed = false;
   let abortRequested = false;
@@ -280,6 +312,42 @@ function waitForProcessClose(
       queueMicrotask(() => finish(child.exitCode, child.signalCode));
     }
   });
+}
+
+function resolveCaptureLimit(
+  options: Pick<ManagedCommandOptions, "maxCapturedOutputBytes">,
+  input: Pick<ManagedCommandInput, "maxCapturedOutputBytes">,
+): number {
+  const captureLimit =
+    input.maxCapturedOutputBytes ??
+    options.maxCapturedOutputBytes ??
+    DEFAULT_CAPTURE_BYTES;
+  validateByteLimit(captureLimit, "maxCapturedOutputBytes");
+  return captureLimit;
+}
+
+function managedProcessOptions(
+  options: ManagedCommandOptions,
+  arguments_: readonly string[],
+  input: Pick<ManagedProcessOptions, "stdinPayload" | "streamStdin" | "signal">,
+): ManagedProcessOptions {
+  return {
+    executable: options.executable,
+    arguments: arguments_,
+    ...input,
+    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+    ...(options.environment === undefined
+      ? {}
+      : { environment: options.environment }),
+    ...(options.windowsSupervisorPath === undefined
+      ? {}
+      : { windowsSupervisorPath: options.windowsSupervisorPath }),
+    ...(options.allowUnsafeProcessTermination === undefined
+      ? {}
+      : {
+          allowUnsafeProcessTermination: options.allowUnsafeProcessTermination,
+        }),
+  };
 }
 
 function validateManagedCommandOptions(options: ManagedCommandOptions): void {

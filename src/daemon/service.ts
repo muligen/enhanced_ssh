@@ -19,6 +19,8 @@ import {
 import { AuditWriter } from "../infra/audit-writer.js";
 import { HostKeyInspector } from "../infra/host-key-inspector.js";
 import { SshExecutor } from "../infra/openssh-executor.js";
+import { SshControlMasterPool } from "../infra/ssh-control-master.js";
+import { StandbyPowerShellExecutor } from "../infra/standby-powershell-executor.js";
 import { PuttySharedExecutor } from "../infra/putty-shared-executor.js";
 import { TailscaleSshExecutor } from "../infra/tailscale-ssh-executor.js";
 import { RoutingSshExecutor } from "../infra/routing-ssh-executor.js";
@@ -117,6 +119,7 @@ interface PreparedGeneration {
   readonly sftp: SftpExecutor;
   readonly hostKeyInspector: TrustedHostKeyInspector;
   readonly generatedSshConfig: GeneratedSshConfig;
+  readonly controlMasters: SshControlMasterPool | undefined;
   dispose(): Promise<void>;
 }
 
@@ -132,13 +135,22 @@ async function prepareGeneration(
     config.ssh.connectTimeoutSeconds,
   );
   const ownedRunners = new Set<SshRunner>();
+  let controlMasters: SshControlMasterPool | undefined;
   try {
     const registry = TargetRegistry.fromConfig(config);
+    controlMasters = await SshControlMasterPool.create({
+      executable: config.ssh.executable,
+      runtimeDirectory: config.runtime.dataDirectory,
+      configFile: generatedSshConfig.path,
+      knownHostsFile: config.ssh.knownHostsFile,
+      connectTimeoutSeconds: config.ssh.connectTimeoutSeconds,
+    });
     const openSshExecutor = new SshExecutor({
       executable: config.ssh.executable,
       configFile: generatedSshConfig.path,
       knownHostsFile: config.ssh.knownHostsFile,
       connectTimeoutSeconds: config.ssh.connectTimeoutSeconds,
+      ...(controlMasters === undefined ? {} : { controlMasters }),
       ...(supervisorPath === undefined ? {} : { windowsSupervisorPath: supervisorPath }),
       allowUnsafeProcessTermination: false,
     });
@@ -147,6 +159,22 @@ async function prepareGeneration(
     const routes = new Map<string, SshRunner>();
     const tailscaleRoutes = new Map<string, TailscaleSshExecutor>();
     for (const target of Object.values(config.targets)) {
+      if (
+        target.connection === undefined &&
+        target.platform === "windows" &&
+        controlMasters !== undefined
+      ) {
+        const pool = controlMasters;
+        const route = new StandbyPowerShellExecutor(openSshExecutor, {
+          sshAlias: target.sshAlias,
+          // The standby holds the shared connection open; once it idles out,
+          // let the connection go too instead of waiting another ControlPersist.
+          onIdle: () => pool.release([target.sshAlias]),
+        });
+        ownedRunners.add(route);
+        routes.set(target.sshAlias, route);
+        continue;
+      }
       if (target.connection?.mode === "tailscale-ssh") {
         if (config.tailscale === undefined) throw new Error("Tailscale SSH requires tailscale.executable");
         const route = new TailscaleSshExecutor({
@@ -199,6 +227,7 @@ async function prepareGeneration(
       configFile: generatedSshConfig.path,
       knownHostsFile: config.ssh.knownHostsFile,
       connectTimeoutSeconds: config.ssh.connectTimeoutSeconds,
+      ...(controlMasters === undefined ? {} : { controlMasters }),
       ...(supervisorPath === undefined ? {} : { windowsSupervisorPath: supervisorPath }),
       allowUnsafeProcessTermination: false,
     });
@@ -231,12 +260,14 @@ async function prepareGeneration(
       sftp,
       hostKeyInspector,
       generatedSshConfig,
+      controlMasters,
       dispose(): Promise<void> {
         if (disposed) return Promise.resolve();
         if (disposeOperation === undefined) {
           const operation = disposeGenerationResources(
             new Set([executor]),
             generatedSshConfig,
+            controlMasters,
           ).then(() => {
             disposed = true;
           });
@@ -252,7 +283,11 @@ async function prepareGeneration(
       },
     };
   } catch (error) {
-    await disposeGenerationResources(ownedRunners, generatedSshConfig).catch(
+    await disposeGenerationResources(
+      ownedRunners,
+      generatedSshConfig,
+      controlMasters,
+    ).catch(
       reportMaintenanceError,
     );
     throw error;
@@ -262,10 +297,12 @@ async function prepareGeneration(
 async function disposeGenerationResources(
   runners: ReadonlySet<SshRunner>,
   generatedSshConfig: GeneratedSshConfig,
+  controlMasters: SshControlMasterPool | undefined,
 ): Promise<void> {
   const results = await Promise.allSettled([
     ...[...runners].map(async (runner) => runner.close()),
     generatedSshConfig.remove(),
+    ...(controlMasters === undefined ? [] : [controlMasters.close()]),
   ]);
   const failures = results.flatMap((result) =>
     result.status === "rejected" ? [result.reason] : [],
@@ -581,7 +618,10 @@ export async function startGatewayDaemon(
         const removed = service!.removeTargets(aliases, metadata);
         transferService!.replaceMetadataRegistry(removed.registry);
         try {
-          await activeGeneration!.executor.removeRoutes(removed.sshAliases);
+          await Promise.all([
+            activeGeneration!.executor.removeRoutes(removed.sshAliases),
+            activeGeneration!.controlMasters?.release(removed.sshAliases),
+          ]);
         } catch (error) {
           // Revocation is committed: persistence must not restore a deleted target.
           throw new GatewayReloadCommittedCleanupError(error);
