@@ -265,7 +265,15 @@ $rules = @($acl.GetAccessRules($true, $false, [System.Security.Principal.Securit
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
     {
       encoding: "utf8",
-      env: { ...process.env, AGENT_SSH_ACL_TEST_TARGET: targetPath },
+      // A PowerShell 7 parent (for example the default GitHub Actions shell)
+      // puts its own module paths first in PSModulePath, and Windows
+      // PowerShell 5.1 then cannot load Microsoft.PowerShell.Security, so
+      // Get-Acl fails. Pin the 5.1 module path, as operation-presets.test.ts does.
+      env: {
+        ...process.env,
+        PSModulePath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+        AGENT_SSH_ACL_TEST_TARGET: targetPath,
+      },
       windowsHide: true,
       timeout: 10_000,
     },
