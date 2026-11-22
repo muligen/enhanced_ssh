@@ -1310,7 +1310,12 @@ test("sync rejects excessive aggregate exclusion complexity before scanning", as
   assert.equal(harness.ssh.calls.length, 0);
 });
 
-test("sync rejects descendant paths over the safe UTF-8 byte limit", async (t) => {
+// The fixture creates a real directory chain whose relative path exceeds
+// MAX_TRANSFER_PATH_BYTES (4096). Under an absolute temp root that exceeds
+// POSIX PATH_MAX (4096 on Linux, 1024 on macOS), so mkdir fails with
+// ENAMETOOLONG; Windows long-path support allows it. The gateway host is
+// Windows-only, and the Windows CI job still runs this test.
+test("sync rejects descendant paths over the safe UTF-8 byte limit", { skip: process.platform !== "win32" }, async (t) => {
   const harness = await createHarness();
   t.after(() => rm(harness.directory, { recursive: true, force: true }));
   let absoluteDirectory = path.join(harness.localRoot, "source");

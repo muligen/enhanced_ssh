@@ -43,6 +43,12 @@ const PRIVATE_KEY_SENTINEL = "PRIVATE-KEY-CONTENTS-MUST-NOT-LEAK";
 const INITIAL_KEY_REVISION = `kr-test0000-${"b".repeat(32)}`;
 const TARGET_KEY_ID = `k-${"1".repeat(32)}`;
 const BASTION_KEY_ID = `k-${"2".repeat(32)}`;
+// Managed mode runs only on a Windows gateway host (see README), so
+// validProfile() and validFleetTarget() use Windows absolute paths (C:\...).
+// The managed path schema accepts only native absolute paths, so on other
+// platforms the server and schema reject these fixtures before the behavior
+// under test is reached. The Windows CI job still runs these tests.
+const windowsOnly = { skip: process.platform !== "win32" };
 
 interface JsonObject {
   readonly [key: string]: unknown;
@@ -402,7 +408,7 @@ async function assertProblem(
   return raw;
 }
 
-test("managed setup routes expose status, key generation, and validated apply", async (t) => {
+test("managed setup routes expose status, key generation, and validated apply", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
 
@@ -437,7 +443,7 @@ test("managed setup routes expose status, key generation, and validated apply", 
   assert.equal(configuration.closeCalls, 1);
 });
 
-test("admin bootstrap and target mutations carry optimistic revisions", async (t) => {
+test("admin bootstrap and target mutations carry optimistic revisions", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
 
@@ -508,7 +514,7 @@ test("admin bootstrap and target mutations carry optimistic revisions", async (t
   assert.equal((await readObject(removeResponse)).configured, false);
 });
 
-test("admin target enabled mutation changes only MCP availability", async (t) => {
+test("admin target enabled mutation changes only MCP availability", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
 
@@ -557,7 +563,7 @@ test("admin target enabled mutation changes only MCP availability", async (t) =>
   assert.equal(configuration.appliedFleets.length, 2);
 });
 
-test("admin AccessClient settings survive target save, update, removal, and bootstrap", async (t) => {
+test("admin AccessClient settings survive target save, update, removal, and bootstrap", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
   const accessClient = { plinkExecutable: accessClientExecutablePath() };
@@ -791,7 +797,7 @@ test("admin key mutations require key revisions and return public fleet state", 
   );
 });
 
-test("admin bootstrap separates public key errors without hiding saved machines", async (t) => {
+test("admin bootstrap separates public key errors without hiding saved machines", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   configuration.fleetProfile = {
     version: 3,
@@ -938,7 +944,7 @@ test("admin key routes reject stale revisions, unsafe paths, and injected fields
   assert.equal(staleRaw.includes(privateKeySourcePath()), false);
 });
 
-test("admin target save accepts key IDs but rejects private key paths", async (t) => {
+test("admin target save accepts key IDs but rejects private key paths", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
   const valid = validFleetTarget();
@@ -974,7 +980,7 @@ test("admin target save accepts key IDs but rejects private key paths", async (t
   assert.equal(savedRaw.includes("privateKeyPath"), false);
 });
 
-test("admin target save accepts only well-formed portal-routed usernames", async (t) => {
+test("admin target save accepts only well-formed portal-routed usernames", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
   const routed = validFleetTarget();
@@ -1013,7 +1019,7 @@ test("admin target save accepts only well-formed portal-routed usernames", async
   assert.equal(configuration.appliedFleets.length, 1);
 });
 
-test("admin rename preserves the stable ID and reserves historical aliases", async (t) => {
+test("admin rename preserves the stable ID and reserves historical aliases", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
 
@@ -1068,7 +1074,7 @@ test("admin rename preserves the stable ID and reserves historical aliases", asy
   });
 });
 
-test("admin target save requires full-access confirmation and rejects alias conflicts", async (t) => {
+test("admin target save requires full-access confirmation and rejects alias conflicts", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
   const fullAccessTarget: ManagedSshFleetTarget = {
@@ -1150,7 +1156,7 @@ test("admin target save requires full-access confirmation and rejects alias conf
   assert.equal(configuration.appliedFleets.length, 1);
 });
 
-test("admin target save rejects isolated restricted fields for full access", async (t) => {
+test("admin target save rejects isolated restricted fields for full access", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
   const isolatedFields: ReadonlyArray<
@@ -1198,7 +1204,7 @@ test("admin target save rejects isolated restricted fields for full access", asy
   assert.deepEqual(configuration.appliedFleets, []);
 });
 
-test("admin target save requires independent transfer authorization", async (t) => {
+test("admin target save requires independent transfer authorization", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
   const transferTarget: ManagedSshFleetTarget = {
@@ -1246,7 +1252,7 @@ test("admin target save requires independent transfer authorization", async (t) 
   );
 });
 
-test("product management mode disables legacy setup mutations", async (t) => {
+test("product management mode disables legacy setup mutations", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startTestUiServer({
     gatewayFactory: configuration.gatewayFactory,
@@ -1641,7 +1647,7 @@ test("admin rejects a detected PuTTY session that resolves to another host", asy
   ]);
 });
 
-test("managed setup apply accepts an explicitly shaped full-access profile", async (t) => {
+test("managed setup apply accepts an explicitly shaped full-access profile", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startManagedServer(t, configuration);
   const profile: CurrentManagedSshProfile = {
@@ -1703,7 +1709,7 @@ test("managed setup apply requires current fields and explicit full-access confi
   assert.deepEqual(configuration.appliedProfiles, []);
 });
 
-test("setup routes are unavailable outside managed mode", async (t) => {
+test("setup routes are unavailable outside managed mode", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const server = await startTestUiServer({
     gatewayFactory: configuration.gatewayFactory,
@@ -1788,7 +1794,7 @@ test("setup apply rejects injected fields without echoing secret input", async (
   assert.equal(configuration.appliedProfiles.length, 0);
 });
 
-test("setup failures expose only stable public errors", async (t) => {
+test("setup failures expose only stable public errors", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const publicError = new ManagedSshError(
     400,
@@ -1824,7 +1830,7 @@ test("setup failures expose only stable public errors", async (t) => {
   assert.equal(internalRaw.includes(PRIVATE_KEY_SENTINEL), false);
 });
 
-test("an active run blocks apply and key generation", { timeout: 5_000 }, async (t) => {
+test("an active run blocks apply and key generation", { ...windowsOnly, timeout: 5_000 }, async (t) => {
   const runStarted = deferred<AbortSignal>();
   const configuration = new FakeConfigurationService(
     controlledRunGatewayFactory(runStarted),
@@ -1869,7 +1875,7 @@ test("an active run blocks apply and key generation", { timeout: 5_000 }, async 
   assert.equal((await readObject(runResponse)).termination, "cancel");
 });
 
-test("active key generation blocks run and apply", { timeout: 5_000 }, async (t) => {
+test("active key generation blocks run and apply", { ...windowsOnly, timeout: 5_000 }, async (t) => {
   let gatewayCalls = 0;
   const gatewayDelegate = successfulGatewayFactory();
   const configuration = new FakeConfigurationService(async () => {
@@ -1915,7 +1921,7 @@ test("active key generation blocks run and apply", { timeout: 5_000 }, async (t)
   assert.equal((await generateResponsePromise).status, 200);
 });
 
-test("active managed key mutation blocks runs and configuration changes", { timeout: 5_000 }, async (t) => {
+test("active managed key mutation blocks runs and configuration changes", { ...windowsOnly, timeout: 5_000 }, async (t) => {
   let gatewayCalls = 0;
   const gatewayDelegate = successfulGatewayFactory();
   const configuration = new FakeConfigurationService(async () => {
@@ -1968,7 +1974,7 @@ test("active managed key mutation blocks runs and configuration changes", { time
   assert.equal((await generateResponsePromise).status, 200);
 });
 
-test("active apply blocks run and key generation", { timeout: 5_000 }, async (t) => {
+test("active apply blocks run and key generation", { ...windowsOnly, timeout: 5_000 }, async (t) => {
   let gatewayCalls = 0;
   const gatewayDelegate = successfulGatewayFactory();
   const configuration = new FakeConfigurationService(async () => {
@@ -2011,7 +2017,7 @@ test("active apply blocks run and key generation", { timeout: 5_000 }, async (t)
   assert.equal((await applyResponsePromise).status, 200);
 });
 
-test("admin group catalog persists empty groups and preserves machine identities through moves, rename, delete and ordinary saves", async (t) => {
+test("admin group catalog persists empty groups and preserves machine identities through moves, rename, delete and ordinary saves", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const identity = `t-${"7".repeat(32)}`;
   configuration.fleetProfile = { version: 3, targets: { alpha: { ...validFleetTarget(), targetId: identity, group: "Legacy" } } };
@@ -2050,7 +2056,7 @@ test("admin group catalog persists empty groups and preserves machine identities
   assert.ok(configuration.fleetProfile!.accessClient);
 });
 
-test("admin group changes reject stale revisions, reserved names, invalid destinations and partial moves atomically", async (t) => {
+test("admin group changes reject stale revisions, reserved names, invalid destinations and partial moves atomically", windowsOnly, async (t) => {
   const configuration = new FakeConfigurationService();
   const revision = `r-original-${"a".repeat(32)}`;
   configuration.fleetRevision = revision;
