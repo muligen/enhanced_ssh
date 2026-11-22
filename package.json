@@ -21,6 +21,7 @@
     "build:typescript": "tsc -p tsconfig.json && node scripts/copy-test-ui-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
+    "test:ts": "npm run build:typescript && node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
     "start:daemon": "node dist/src/daemon/main.js",
     "start:cli": "node dist/src/cli/main.js",
     "start:mcp": "node dist/src/mcp/main.js",
