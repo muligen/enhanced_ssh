@@ -10,10 +10,10 @@ Agent SSH Gateway 是一个运行在 Windows 本机、面向 Codex 和其他 AI 
 
 - **三种连接方式**：OpenSSH 私钥、AccessClient/PuTTY 已登录共享会话，以及原生 Tailscale SSH。
 - **集中管理**：本机 Web 管理中心维护全局私钥库和最多 1,024 个目标；MCP 不暴露配置修改或私钥读取接口。
-- **三档权限**：精确单行命令白名单、`full-access` 和 `deny`，另有独立的目标启用开关。
+- **四档权限**：精确单行命令白名单（`allow-list`）、固定只读预设操作（`presets`）、`full-access` 和 `deny`，另有独立的目标启用开关。
 - **结构化执行**：Full access 目标支持固定 shell、工作目录、环境变量和多行脚本，不把脚本正文放进本机 `ssh.exe` 参数。
 - **可恢复长任务**：构建等任务由 daemon 持有，可跨 MCP 客户端断连继续运行，并支持增量日志、状态查询、取消和超时。
-- **受控文件传输**：OpenSSH 目标支持上传、下载和本机到远端的单向目录同步，包含 `dryRun`、断点续传、SHA-256 校验和配额控制。
+- **受控文件传输**：OpenSSH 目标（经 SFTP）和 `full-access` 的 AccessClient 目标（经共享 shell）支持上传、下载和本机到远端的单向目录同步，包含 `dryRun`、断点续传、SHA-256 校验和配额控制。
 - **部署前观测**：固定只读探针可读取机器身份、系统、磁盘、Docker/Compose 状态，并检查 Compose 配置、端口归属、容器健康和可用空间。
 - **Windows 进程清理**：实际 SSH 命令和文件传输使用的 `ssh.exe`、`sftp.exe`、`plink.exe` 都通过 .NET Job Object supervisor 启动，取消、超时和父进程退出时清理本机进程树。
 - **受保护的输出与审计**：大输出以不透明引用分页读取；审计记录请求摘要和结果，不记录原始命令、脚本、输出、token 或路径。
@@ -43,6 +43,8 @@ flowchart LR
 - Gateway daemon：持有配置 generation、任务、输出、审计和 Named Pipe RPC。
 - OpenSSH / Plink：根据目标连接模式选择的受管子进程。
 
+OpenSSH 连接复用和 Windows 目标的 PowerShell 预启动目前**只在非 Windows 网关上生效**。在非 Windows 网关上，daemon 为每个 OpenSSH 目标维持一个自有的 OpenSSH control master，命令和 SFTP 复用这条已认证的连接；Windows 目标还会在这条连接上预先启动一个 `powershell.exe`，留给下一条命令使用。Win32-OpenSSH 不支持 ControlMaster，所以在 Windows 网关（也就是当前唯一受支持的运行端）上这两项都不启用：每条命令、每次 SFTP 调用仍单独建立并认证 SSH 连接，远端 PowerShell 也是冷启动。AccessClient 和 Tailscale 目标不走这条路径。
+
 所有配置修改都在管理中心完成。保存配置时，服务会生成并校验新的不可变 revision；没有活动操作时，daemon 在原 Named Pipe 和 runtime token 上热加载新 generation，当前 MCP 进程无需重启。
 
 ## 环境要求
@@ -65,6 +67,10 @@ AccessClient 目标还需要：
 不要直接把未经独立指纹核验的 `ssh-keyscan` 输出作为信任依据。
 
 ## 快速开始
+
+> **部署前提**：Gateway 的权限控制只约束“只能通过 MCP 调用 Gateway”的 Agent。只要 Agent 能在 Gateway 本机执行命令，或能读取 Gateway 运行账户的数据目录（默认 `%LOCALAPPDATA%\agent-ssh-gateway\managed`，或 `--managed-directory` 指定的目录），白名单、预设、`deny` 和禁用开关就都不成立。例如 `runtime\admin.json` 中保存着带管理员 token 的完整管理地址，拿到它就等于拿到管理中心的管理员权限，可以修改任何目标的权限；托管目录中还有 daemon token（`runtime\runtime.json`）、浏览器会话签名密钥和 SSH 私钥。
+>
+> 因此必须用 Agent 自身的沙箱，把它执行本机命令和读取文件的能力限制在这些目录之外，并实际确认沙箱限制的是读取，而不只是写入。目前代码不支持“Gateway 用独立 Windows 账户运行、Agent 在另一个账户中调用”的部署方式：MCP 进程必须读取 runtime 目录，而该目录只允许 Gateway 运行账户和 `SYSTEM` 访问。
 
 在仓库根目录执行：
 
@@ -149,7 +155,9 @@ AccessClient 模式复用本机已经登录的 PuTTY 共享连接，不读取 Ac
 
 同一时间只能准备一台 AccessClient 目标，准备期间配置变更会被拒绝。临时 PuTTY `LogHost` 设置会在验证成功、超时、取消、失败或服务关闭时恢复；中断恢复状态保存在受保护的本机 runtime 中。
 
-每个目标最多维持一条受管 Plink 下游会话。同一目标的命令按 FIFO 执行，不同目标可并行；会话空闲 60 秒回收，绝对寿命为 10 分钟。AccessClient 模式当前只提供命令通道，上传、下载和目录同步始终关闭。
+每个目标最多维持一条受管 Plink 下游会话。同一目标的命令按 FIFO 串行执行，不同目标可并行；会话空闲 60 秒回收，绝对寿命为 10 分钟。
+
+`full-access` 的 AccessClient 目标还支持上传、下载和本机到远端的目录同步：数据经这条共享 shell 分块传输，与该目标的命令排在同一个 FIFO 队列中。和 OpenSSH Full access 一样，它可以使用任意合法的本机和远端绝对路径，因此 Agent 能读取 Gateway 本机上运行账户可读的任何文件。其他权限模式下，AccessClient 目标的文件传输始终关闭。
 
 ## 配置原生 Tailscale SSH
 
@@ -173,23 +181,28 @@ AccessClient 模式复用本机已经登录的 PuTTY 共享连接，不读取 Ac
 
 下表描述 Web 管理中心保存的 v3 托管目标：
 
-| 模式 | 单行命令 | 结构化脚本 | OpenSSH 文件传输 | AccessClient 文件传输 |
-| --- | --- | --- | --- | --- |
-| `allow-list` | 仅精确匹配 | 不允许 | 按独立传输策略 | 不允许 |
-| `full-access` | 任意合法命令 | 允许 | 合法绝对路径双向 | 不允许 |
-| `deny` | 不允许 | 不允许 | 不允许 | 不允许 |
+| 模式 | 单行命令 | 结构化脚本 | 预设只读操作 | OpenSSH 文件传输 | AccessClient 文件传输 |
+| --- | --- | --- | --- | --- | --- |
+| `allow-list` | 仅精确匹配 | 不允许 | 不允许 | 按独立传输策略 | 不允许 |
+| `presets` | 不允许 | 不允许 | 仅已勾选的预设 | 不允许 | 不允许 |
+| `full-access` | 任意合法命令 | 允许 | 不适用，直接用 `ssh_exec` | 合法绝对路径双向 | 合法绝对路径双向（经共享 shell） |
+| `deny` | 不允许 | 不允许 | 不允许 | 不允许 | 不允许 |
 
 `allow-list` 按完整 UTF-8 单行字符串精确匹配，不支持正则、通配符或参数模板。远端 shell 仍会解释其中的重定向、替换和运算符，所以每条白名单都应按可执行代码审查。
 
-`full-access` 不是沙箱。它允许远端账户范围内的任意代码执行；OpenSSH 目标还可访问 Gateway 运行账户可读取的合法本机绝对路径。每次保存 Full access 配置都需要重新确认风险。
+`presets` 只允许通过 `ssh_list_allowed_operations` 和 `ssh_run_operation` 调用管理员为该目标勾选的固定只读操作（单次最长取目标上限与 15 秒中的较小值），拒绝 `ssh_exec`、`ssh_start`、组命令和全部文件传输。可选预设和日志范围见 [docs/permission-presets.md](docs/permission-presets.md)。
 
-`ssh_check_connection` 和 `ssh_target_info` 是只读例外：它们使用 Gateway 固定探针，可在 `allow-list`、`full-access` 或 `deny` 模式下诊断启用的目标。`ssh_docker_preflight` 仍只对 `full-access` 开放。禁用目标会拒绝探针、命令和文件传输。
+`full-access` 不是沙箱。它允许远端账户范围内的任意代码执行；OpenSSH 和 AccessClient 目标还可经文件传输读写 Gateway 运行账户能访问的任意合法本机绝对路径。每次保存 Full access 配置都需要重新确认风险。
+
+`ssh_check_connection` 和 `ssh_target_info` 是只读例外：它们使用 Gateway 固定探针，可在 `allow-list`、`presets`、`full-access` 或 `deny` 模式下诊断启用的目标。`ssh_docker_preflight` 仍只对 `full-access` 开放。禁用目标会拒绝探针、命令和文件传输。
 
 结构化执行仅对 `full-access` 目标开放。
 
 低层手写 `gateway.yaml` 的命令策略与文件传输策略彼此独立：即使命令策略为 `deny`，管理员仍可显式授权文件传输。该高级模式应分别审查 `policy` 和 `transfer`；它不受上表中托管 UI 联动规则约束。
 
 ## 接入 Codex
+
+> **接入前先确认部署前提**：按当前实现，Codex（以及它启动的 MCP 进程）需要和 Gateway 运行在同一个 Windows 账户下，代码目前不支持把 Gateway 放到独立账户中运行。下面 `--data-directory` 指向的 runtime 目录里就有带管理员 token 的 `admin.json` 和 daemon token。只要 Codex 能执行本机命令，或能读取该账户的 Gateway 数据目录，权限控制就不成立。请配置 Codex 的沙箱，让它执行的命令和文件读取都访问不到 `%LOCALAPPDATA%\agent-ssh-gateway`（或自定义的托管目录），并实际确认沙箱限制的是读取，而不只是写入；这项限制针对的是 Agent 自己的命令和文件工具，`agent-ssh-mcp` 进程本身仍需读取 runtime 目录。详见上文“快速开始”中的部署前提。
 
 在用户级 `C:\Users\YOUR_NAME\.codex\config.toml` 中配置：
 
@@ -223,25 +236,36 @@ daemon 与 MCP 当前使用内部协议 v8，并严格校验版本。Gateway 尚
 
 ## MCP 工具
 
+当前共注册 24 个工具：
+
 | 工具 | 用途 |
 | --- | --- |
 | `ssh_gateway_status` | 查看管理服务、Gateway 和目标摘要 |
 | `ssh_open_admin` | 在默认浏览器打开管理中心，不向 Agent 返回管理员 token |
 | `ssh_ping` | 检查底层 Gateway daemon |
 | `ssh_list_targets` | 列出目标 ID、别名、平台、启用状态和有效权限 |
+| `ssh_list_groups` | 列出机器分组、成员目标 ID 和启用状态 |
 | `ssh_check_connection` | 使用固定 `hostname` 探针检测目标 |
 | `ssh_exec` | 同步执行单行命令或 Full access 结构化脚本 |
 | `ssh_start` | 启动 daemon 持有的长任务并返回 `runId` |
 | `ssh_status` | 查询任务状态、时长、输出计数和最终结果 |
 | `ssh_tail` | 使用不透明 cursor 增量读取任务 UTF-8 日志 |
 | `ssh_cancel` | 按 `runId` 取消执行或传输任务 |
-| `ssh_upload` | 启动一个受控 SFTP 上传任务 |
-| `ssh_download` | 启动一个受控 SFTP 下载任务 |
+| `ssh_list_allowed_operations` | 列出 `presets` 目标获准的固定只读操作及参数 |
+| `ssh_run_operation` | 执行一个获准的固定只读预设操作 |
+| `ssh_group_cpu` | 采样一个分组内已启用机器的 CPU，返回逐台结果和汇总 |
+| `ssh_group_start` | 在一个分组的每台机器上排队启动 daemon 任务，立即返回 `groupRunId` |
+| `ssh_group_status` | 查询分组任务进度和每台机器的 `runId` |
+| `ssh_group_cancel` | 请求取消分组中尚未结束的任务 |
+| `ssh_upload` | 启动一个受控上传任务（OpenSSH 经 SFTP，AccessClient 经共享 shell） |
+| `ssh_download` | 启动一个受控下载任务（OpenSSH 经 SFTP，AccessClient 经共享 shell） |
 | `ssh_sync` | 本机到远端的非删除式单向目录同步 |
 | `ssh_target_info` | 固定只读探针：机器 ID、host key、OS、磁盘及 Docker/Compose |
 | `ssh_docker_preflight` | 固定只读 Docker 部署预检 |
 | `ssh_read_output` | 以 Base64 分页读取同步执行的保留输出 |
 | `ssh_read_output_text` | 以 UTF-8 文本和不透明 cursor 读取保留输出 |
+
+预设操作的用法见 [docs/permission-presets.md](docs/permission-presets.md)，分组与组控工具见 [docs/machine-groups.md](docs/machine-groups.md)。
 
 ### 执行命令
 
@@ -304,7 +328,7 @@ ssh_cancel({ "runId": "..." }) -> 取消仍在运行的任务
 }
 ```
 
-OpenSSH Full access 目标可省略 `localRoot`，直接使用 Gateway 本机和远端的合法绝对路径。建议先以 `dryRun: true` 检查，再明确改为 `false`；`overwrite: true` 具有破坏性。
+Full access 目标（OpenSSH 和 AccessClient）可省略 `localRoot`，直接使用 Gateway 本机和远端的合法绝对路径。建议先以 `dryRun: true` 检查，再明确改为 `false`；`overwrite: true` 具有破坏性。
 
 `ssh_upload`、`ssh_download` 和 `ssh_sync` 都返回 `runId`，通过相同的 `ssh_status`、`ssh_tail` 和 `ssh_cancel` 跟踪。同步只从本机复制到远端，不删除远端多余文件。所有模式仍会执行路径规范化、文件类型检查、配额、校验和、受控发布、超时、取消与审计。
 
@@ -399,11 +423,11 @@ npm run start:test-ui -- --demo
 src/
   service/    产品服务入口与管理控制面描述符
   daemon/     Gateway 生命周期、IPC、配置 generation 与存储安全
-  mcp/        stdio MCP 服务和 17 个工具
+  mcp/        stdio MCP 服务和 24 个工具
   core/       目标授权、执行、任务、输出、探针与文件传输
   infra/      OpenSSH、Plink、SFTP、进程树、host key 与审计
   config/     严格 YAML 配置加载
-  shared/     RPC v6 协议、路径、错误和客户端
+  shared/     RPC v8 协议、路径、错误和客户端
   test-ui/    Web 管理中心及托管 v3 配置
 native/
   windows-job-supervisor/   .NET 9 Job Object supervisor
