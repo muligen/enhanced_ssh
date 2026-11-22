@@ -247,7 +247,7 @@ export function createMcpServer(
     "ssh_exec",
     {
       description:
-        "Run a command synchronously on an SSH target. Accepts the compatible single command form or a full-access structured shell/script/cwd/env form. Prefer ssh_start for builds, downloads, and other long work.",
+        "Run a command synchronously on an SSH target. Accepts the compatible single command form or a full-access structured shell/script/cwd/env form. On allow-list targets, command must exactly equal one approved command string as a whole: there is no prefix, pattern, or argument matching, so any extra space or argument is denied, and the structured form is rejected. If timeoutMs is omitted, the target's full maxTimeoutMs is used (see ssh_list_targets; up to 1 hour). Use ssh_start instead for builds, installs, downloads, and other long-running work. On an AccessClient target, commands share one session and run one at a time in FIFO order (file transfers to that target use the same queue); time spent waiting counts toward timeoutMs.",
       inputSchema: execRunParamsSchema,
       outputSchema: execResultSchema,
       annotations: {
@@ -271,7 +271,7 @@ export function createMcpServer(
     "ssh_start",
     {
       description:
-        "Start a daemon-owned SSH execution and return a runId immediately. The task continues across MCP client disconnects; use ssh_status and ssh_tail to follow it.",
+        "Start a daemon-owned SSH execution and return a runId immediately. The task continues across MCP client disconnects; use ssh_status and ssh_tail to follow it. Accepts the same forms and policy rules as ssh_exec. If the start response is missing or uncertain (for example after a transport error or timeout), do not retry automatically: the first request may already have started the task, and a retry can repeat its remote side effects. On an AccessClient target, a running task holds the target's single shared session, so later commands and transfers on that target wait in FIFO order.",
       inputSchema: execRunParamsSchema,
       outputSchema: taskStartResultSchema,
       annotations: {
@@ -311,7 +311,7 @@ export function createMcpServer(
     "ssh_tail",
     {
       description:
-        "Read new UTF-8 stdout and stderr from a daemon-owned task using an opaque cursor. No Base64 decoding or byte-offset bookkeeping is required.",
+        "Read new UTF-8 stdout and stderr from a daemon-owned task using an opaque cursor. No Base64 decoding or byte-offset bookkeeping is required. Task logs are a bounded rolling buffer: check each stream's droppedBytes (non-zero means that much older output was discarded before this read and is missing from text) and hadDecodingErrors (true means the bytes were not valid UTF-8 and text contains replacement characters, so it is not an exact copy).",
       inputSchema: taskTailParamsSchema,
       outputSchema: taskTailResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
