@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { z } from "zod";
+
 import {
   MANAGED_PLATFORM_COMMANDS,
   MANAGED_PLATFORMS,
@@ -195,6 +197,16 @@ test("managed AccessClient profiles preserve ports and reject ambiguous shares",
   assert.equal(managedSshFleetProfileSchema.safeParse(duplicate).success, true);
 });
 
+// Since zod 4.5 an unrecognized key no longer aborts a union branch, so when
+// both the current and the legacy profile branch fail without aborting, zod
+// reports a single invalid_union issue and the branch issues sit in `errors`.
+function issueMessages(issues: readonly z.core.$ZodIssue[]): string[] {
+  return issues.flatMap((issue) => [
+    issue.message,
+    ...(issue.code === "invalid_union" ? issue.errors.flatMap(issueMessages) : []),
+  ]);
+}
+
 test("managed profile rejects malformed portal-routed SSH usernames", () => {
   const invalidUsernames = [
     "portal/system",
@@ -215,7 +227,11 @@ test("managed profile rejects malformed portal-routed SSH usernames", () => {
     const result = managedSshProfileSchema.safeParse(profile);
     assert.equal(result.success, false, username);
     if (!result.success) {
-      assert.match(result.error.issues[0]?.message ?? "", /portalUser\/targetIPv4\/systemUser/u);
+      const messages = issueMessages(result.error.issues);
+      assert.ok(
+        messages.some((message) => /portalUser\/targetIPv4\/systemUser/u.test(message)),
+        `${username}: ${messages.join("; ")}`,
+      );
     }
   }
 });
