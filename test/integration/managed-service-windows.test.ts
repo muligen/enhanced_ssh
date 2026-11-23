@@ -235,7 +235,7 @@ test(
 
     service = await createManagedSshService(managedDirectory);
     const status = await service.fleetStatus();
-    assert.equal(status.state, "ready");
+    assert.equal(status.state, "ready", JSON.stringify(status));
     assert.notEqual(status.revision, revision, JSON.stringify(status));
     assert.equal(await rollbackRevision(managedDirectory), revision);
     const migrated = managedSshFleetProfileSchema.parse(status.profile);
@@ -272,6 +272,7 @@ test(
             transferScope: "all",
             transferRoots: [],
             maxTimeoutMs: 30_000,
+            maxTransferTimeoutMs: 3_600_000,
           },
         ],
       });
@@ -366,7 +367,7 @@ test(
     await writeFile(path.join(keyDirectory, "manifest.json"), "not-json\n", "utf8");
     service = await createManagedSshService(managedDirectory);
     const fallback = await service.fleetStatus();
-    assert.equal(fallback.state, "ready");
+    assert.equal(fallback.state, "ready", JSON.stringify(fallback));
     assert.equal(fallback.configured, true);
     assert.equal(fallback.revision, legacyRevision);
     assert.equal(fallback.profile?.targets.xiaoxu_deploy?.targetId,
@@ -379,7 +380,7 @@ test(
 
     service = await createManagedSshService(managedDirectory);
     const migrated = await service.fleetStatus();
-    assert.equal(migrated.state, "ready");
+    assert.equal(migrated.state, "ready", JSON.stringify(migrated));
     assert.notEqual(migrated.revision, legacyRevision);
     assert.equal(await rollbackRevision(managedDirectory), legacyRevision);
     assert.equal(migrated.keys.length, 1);
@@ -822,6 +823,9 @@ test(
     });
     const firstRevision = firstStatus.revision!;
     await delay(5);
+    // A description-only edit is a metadata save: it keeps the active revision
+    // and publishes no revision directory. Also change an operational field so
+    // this save publishes the immutable revision the recovery paths below need.
     const secondStatus = await service.applyFleet(
       {
         version: 3,
@@ -829,6 +833,7 @@ test(
           recovery: {
             ...firstStatus.profile!.targets.recovery!,
             description: "Recovery v2",
+            maxTimeoutMs: 45_000,
           },
         },
       },
@@ -836,6 +841,10 @@ test(
     );
     const secondRevision = secondStatus.revision!;
     assert.notEqual(secondRevision, firstRevision);
+    assert.deepEqual(
+      await revisionDirectories(managedDirectory),
+      [firstRevision, secondRevision].sort(),
+    );
     await service.close();
     service = undefined;
 
@@ -940,6 +949,8 @@ test(
       [firstRevision, secondRevision, invalidRevision].sort(),
     );
 
+    // An operational change again, so the save publishes a new revision and
+    // prunes the superseded and quarantined ones.
     const replacement = await service.applyFleet(
       {
         version: 3,
@@ -947,6 +958,7 @@ test(
           recovery: {
             ...reopenedRollback.profile!.targets.recovery!,
             description: "Recovery saved",
+            maxTimeoutMs: 60_000,
           },
         },
       },
@@ -1053,6 +1065,7 @@ test(
             transferScope: "restricted",
             transferRoots: [],
             maxTimeoutMs: 30_000,
+            maxTransferTimeoutMs: 3_600_000,
           },
         ],
       });
@@ -1087,7 +1100,7 @@ test(
     );
     service = await createManagedSshService(managedDirectory);
     const legacyReopened = await service.status();
-    assert.equal(legacyReopened.state, "unconfigured");
+    assert.equal(legacyReopened.state, "unconfigured", JSON.stringify(legacyReopened));
     assert.equal(legacyReopened.configured, true);
     assert.equal("platform" in legacyReopened.profile!, false);
     assert.equal("policyMode" in legacyReopened.profile!, false);
@@ -1253,7 +1266,15 @@ $everyoneAllowed = @($acl.GetAccessRules($true, $false, [System.Security.Princip
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
     {
       encoding: "utf8",
-      env: { ...process.env, AGENT_SSH_MANAGED_ACL_TARGET: targetPath },
+      // A PowerShell 7 parent (for example the default GitHub Actions shell)
+      // puts its own module paths first in PSModulePath, and Windows
+      // PowerShell 5.1 then cannot load Microsoft.PowerShell.Security, so
+      // Get-Acl fails. Pin the 5.1 module path, as operation-presets.test.ts does.
+      env: {
+        ...process.env,
+        PSModulePath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+        AGENT_SSH_MANAGED_ACL_TARGET: targetPath,
+      },
       windowsHide: true,
       timeout: 10_000,
     },
@@ -1388,6 +1409,7 @@ async function convertFleetRevisionToSingle(
   if (removePlatform) {
     singleGateway = singleGateway.replace(/^    platform: [^\r\n]+\r?\n/mu, "");
   }
+  singleGateway = withoutFleetGroupCatalog(singleGateway);
   assert.notEqual(singleSsh, fleetSsh);
   assert.notEqual(singleGateway, fleetGateway);
   await Promise.all([
@@ -1407,6 +1429,10 @@ async function convertFleetRevisionToV2(
 ): Promise<void> {
   const revisionDirectory = path.join(managedDirectory, "revisions", revision);
   const profilePath = path.join(revisionDirectory, "profile.json");
+  const gatewayPath = path.join(revisionDirectory, "gateway.yaml");
+  const legacyGateway = withoutFleetGroupCatalog(
+    await readFile(gatewayPath, "utf8"),
+  );
   const current = JSON.parse(await readFile(profilePath, "utf8")) as {
     version: number;
     targets: Record<string, Record<string, unknown>>;
@@ -1435,11 +1461,28 @@ async function convertFleetRevisionToV2(
     }
     targets[alias] = target;
   }
-  await writeFile(
-    profilePath,
-    `${JSON.stringify({ version: 2, targets }, null, 2)}\n`,
-    "utf8",
+  await Promise.all([
+    writeFile(
+      profilePath,
+      `${JSON.stringify({ version: 2, targets }, null, 2)}\n`,
+      "utf8",
+    ),
+    writeFile(gatewayPath, legacyGateway, "utf8"),
+  ]);
+}
+
+// Every fleet v3 revision written since fleet groups were added stores a
+// top-level `groups:` catalog in gateway.yaml. Single-profile and fleet v2
+// revisions predate that key, and their validators re-render gateway.yaml
+// without it, so a faithful historical fixture must not keep the catalog.
+function withoutFleetGroupCatalog(gatewaySource: string): string {
+  const legacySource = gatewaySource.replace(/^groups: \[\]\r?\n/mu, "");
+  assert.notEqual(
+    legacySource,
+    gatewaySource,
+    "the generated v3 gateway.yaml must contain the empty groups catalog",
   );
+  return legacySource;
 }
 
 async function assertManagedCopies(

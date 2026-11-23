@@ -12,6 +12,13 @@ import {
   type ManagedSshFleetProfile,
 } from "../../src/test-ui/managed.js";
 
+// Managed mode runs only on a Windows gateway host (see README), so these
+// fixtures use Windows absolute paths (C:\...). The managed path schema
+// accepts only native absolute paths, so on other platforms parse() rejects
+// the fixtures before the behavior under test is reached. The Windows CI job
+// still runs these tests.
+const windowsOnly = { skip: process.platform !== "win32" };
+
 function validProfile(): CurrentManagedSshProfile {
   return {
     target: {
@@ -88,7 +95,7 @@ function validAccessClientFleetProfile(): Record<string, unknown> {
   };
 }
 
-test("fleet catalog preserves empty groups, migrates legacy membership, and reserves the default name", () => {
+test("fleet catalog preserves empty groups, migrates legacy membership, and reserves the default name", windowsOnly, () => {
   const fleet = validFleetProfile();
   fleet.targets["dev-linux"]!.group = "Legacy";
   assert.equal(managedSshFleetProfileSchema.parse(fleet).groups, undefined);
@@ -103,7 +110,7 @@ test("fleet catalog preserves empty groups, migrates legacy membership, and rese
   }
 });
 
-test("fleet group names round-trip without changing legacy ungrouped targets", () => {
+test("fleet group names round-trip without changing legacy ungrouped targets", windowsOnly, () => {
   const fleet = validFleetProfile();
   assert.equal(managedSshFleetProfileSchema.parse(fleet).targets["dev-linux"]?.group, undefined);
   fleet.targets["dev-linux"]!.group = "  A 组  ";
@@ -116,7 +123,7 @@ test("fleet group names round-trip without changing legacy ungrouped targets", (
   }
 });
 
-test("managed profile accepts strict target and optional bastion endpoints", () => {
+test("managed profile accepts strict target and optional bastion endpoints", windowsOnly, () => {
   const profile = validProfile();
   const withBastion = {
     ...profile,
@@ -134,7 +141,7 @@ test("managed profile accepts strict target and optional bastion endpoints", () 
   assert.equal(managedSshProfileSchema.safeParse(profile).success, true);
 });
 
-test("managed profile accepts portal-routed SSH usernames", () => {
+test("managed profile accepts portal-routed SSH usernames", windowsOnly, () => {
   const profile = validProfile();
   profile.target.username = "portal.user/192.0.2.24/Administrator";
   profile.bastion = {
@@ -152,7 +159,7 @@ test("managed profile accepts portal-routed SSH usernames", () => {
   assert.deepEqual(managedSshFleetProfileSchema.parse(fleet), fleet);
 });
 
-test("managed AccessClient profiles preserve ports and reject ambiguous shares", () => {
+test("managed AccessClient profiles preserve ports and reject ambiguous shares", windowsOnly, () => {
   const fleet = validAccessClientFleetProfile();
   assert.deepEqual(managedSshFleetProfileSchema.parse(fleet), fleet);
 
@@ -213,7 +220,7 @@ test("managed profile rejects malformed portal-routed SSH usernames", () => {
   }
 });
 
-test("managed profile accepts platform presets and preserves legacy revisions", () => {
+test("managed profile accepts platform presets and preserves legacy revisions", windowsOnly, () => {
   for (const platform of MANAGED_PLATFORMS) {
     const profile = {
       ...validProfile(),
@@ -230,7 +237,7 @@ test("managed profile accepts platform presets and preserves legacy revisions", 
   assert.equal(currentManagedSshProfileSchema.safeParse(legacy).success, false);
 });
 
-test("managed profile accepts explicit full access only without allow-list commands", () => {
+test("managed profile accepts explicit full access only without allow-list commands", windowsOnly, () => {
   const fullAccess = {
     ...validProfile(),
     platform: "windows" as const,
@@ -344,7 +351,7 @@ test("managed profile enforces port, command, and strict object boundaries", () 
   }
 });
 
-test("fleet v3 accepts multiple strict targets and arbitrary allow-list commands", () => {
+test("fleet v3 accepts multiple strict targets and arbitrary allow-list commands", windowsOnly, () => {
   const fleet = validFleetProfile();
   fleet.targets["admin-windows"] = {
     enabled: false,
@@ -391,7 +398,7 @@ test("fleet v3 accepts multiple strict targets and arbitrary allow-list commands
   );
 });
 
-test("fleet v3 preserves optional stable identities and rejects reference collisions", () => {
+test("fleet v3 preserves optional stable identities and rejects reference collisions", windowsOnly, () => {
   const fleet = validFleetProfile();
   fleet.targets["dev-linux"] = {
     ...fleet.targets["dev-linux"]!,
@@ -418,7 +425,7 @@ test("fleet v3 preserves optional stable identities and rejects reference collis
   }
 });
 
-test("fleet v3 preserves full-access transfer fields but deny policy fails closed", () => {
+test("fleet v3 preserves full-access transfer fields but deny policy fails closed", windowsOnly, () => {
   const fullAccess = {
     ...validFleetProfile().targets["dev-linux"],
     policyMode: "full-access" as const,

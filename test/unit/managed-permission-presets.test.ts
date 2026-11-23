@@ -18,7 +18,10 @@ const target = {
   transferMode: "deny",
 };
 
-test("managed preset selections survive fleet serialization without converting other machines", () => {
+// knownHostsFile is a Windows absolute path (managed mode runs only on a
+// Windows gateway host); the managed path schema rejects it on other
+// platforms. The Windows CI job still runs this test.
+test("managed preset selections survive fleet serialization without converting other machines", { skip: process.platform !== "win32" }, () => {
   const legacy = { ...target, policyMode: "full-access", permissionPresets: undefined, logPaths: undefined, logServices: undefined };
   const { permissionPresets: _presets, logPaths: _paths, logServices: _services, ...unrestricted } = legacy;
   const profile = { version: 3, targets: { restricted: target, existing: unrestricted } };
