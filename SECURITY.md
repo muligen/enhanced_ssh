@@ -16,7 +16,7 @@ Gateway 控制的是“只拥有 IPC/MCP 调用能力的 Agent”。它不是同
 
 ## IPC
 
-Windows Named Pipe 的随机名称本身不是安全边界。daemon 启动时生成 256-bit 随机 token，保存在经 ACL 收紧的 `runtime.json`；连接首帧必须使用恒定时间比较完成认证。未认证连接不能调用任何业务方法。认证握手还严格要求内部协议 v6；版本不一致会 fail closed，不会降级解析新旧方法或 schema。
+Windows Named Pipe 的随机名称本身不是安全边界。daemon 启动时生成 256-bit 随机 token，保存在经 ACL 收紧的 `runtime.json`；连接首帧必须使用恒定时间比较完成认证。未认证连接不能调用任何业务方法。认证握手还严格要求内部协议 v8；版本不一致会 fail closed，不会降级解析新旧方法或 schema。
 
 daemon 使用 data directory 内的原子 lease 保证同一运行目录只有一个实例。启动时会把 data directory、审计目录/文件、输出目录及仍保留的输出文件所有者设为 daemon 用户，并把 DACL 重建为仅 daemon 用户与 `SYSTEM`；遇到 junction、符号链接、异常嵌套或硬链接时会拒绝启动。
 
@@ -24,7 +24,7 @@ Phase 1 没有给 Named Pipe 设置自定义内核 DACL，因此部署安全性�
 
 ## 本机管理中心
 
-管理中心是常驻服务的本机管理员控制面，不是远程或多用户运维服务。它只绑定 IPv4 loopback；MCP 不暴露配置修改 API，也不返回私钥内容。真实命令和传输仍由 daemon 独立执行目标映射、平台处理、策略、超时、并发、输出/文件配额和审计检查。OpenSSH `full-access` 跳过命令 allow-list 以及本机/远端传输根目录的范围匹配，并把有效传输方向固定为双向；AccessClient `full-access` 只跳过命令 allow-list，文件传输固定拒绝。两者都不绕过其他限制，并且每次保存 full-access 目标都要求服务端校验的显式确认。开发者 `--demo` 模式只使用内置模拟结果，不连接 daemon 或 SSH。
+管理中心是常驻服务的本机管理员控制面，不是远程或多用户运维服务。它只绑定 IPv4 loopback；MCP 不暴露配置修改 API，也不返回私钥内容。真实命令和传输仍由 daemon 独立执行目标映射、平台处理、策略、超时、并发、输出/文件配额和审计检查。OpenSSH 和 AccessClient 的 `full-access` 都跳过命令 allow-list 以及本机/远端传输根目录的范围匹配，并把有效传输方向固定为双向；AccessClient 的传输经该目标的受管 Plink 共享 shell 分块执行。这意味着在 OpenSSH 或 AccessClient 的 full-access 目标上，Agent 都能读到网关本机上 Gateway 运行账户可读的任何文件，包括本机私钥、凭据，以及 Gateway 自己的托管目录和 runtime 文件（例如带管理员 token 的 `runtime\admin.json`）；Full access 的本机路径没有针对这些目录的排除规则。两者都不绕过其他限制，并且每次保存 full-access 目标都要求服务端校验的显式确认。开发者 `--demo` 模式只使用内置模拟结果，不连接 daemon 或 SSH。
 
 管理中心不接受密码、口令、AccessClient URI/票据/原始参数、任意 OpenSSH directive、`ProxyCommand` 或原始 `ProxyJump`。私钥生成和一次性路径导入只在“全局设置”中进行；生成算法限定为 Ed25519 或 RSA 3072。RSA 公钥记录虽然使用 `ssh-rsa` key type，连接仍由 OpenSSH 协商 RSA-SHA2，不会自动开启旧 SHA-1 `ssh-rsa` 签名。OpenSSH 目标和可选堡垒机只能提供结构化 host、port、user 和全局密钥 `keyId`，代理跳转只引用后端生成的固定别名。AccessClient 目标只保存 Plink 路径、物理网关 host/port/user、用于选择 PuTTY pipe 的共享逻辑 host、目标展示端点和预期 hostname。用户名只接受普通安全段，或严格的 `portalUser/targetIPv4/systemUser` 三段透传格式。v3 profile 不接受 `identityFile`，也不保存导入源路径。发布时，服务端按 `keyId` 从受保护的全局密钥库解析 OpenSSH 私钥，并把私钥与 `known_hosts` 复制到 `%LOCALAPPDATA%` 下 ACL 仅允许当前用户与 `SYSTEM` 的 staging revision；AccessClient 目标不生成或复制私钥和 `known_hosts`。
 
@@ -70,11 +70,13 @@ daemon 固定启用：
 - `StrictHostKeyChecking=yes`
 - 指定的 `UserKnownHostsFile`，并禁用全局 known-hosts 回退
 - 禁用 agent/X11 forwarding、所有端口转发、local command、escape command line
-- 禁用 ControlMaster/ControlPersist/ControlPath 和密钥自动写入 agent
+- 禁用密钥自动写入 agent；管理员配置不能开启连接复用：wrapper 固定 `ControlMaster no`、`ControlPersist no`、`ControlPath none`，命令进程还固定 `ControlMaster=no`、`ControlPersist=no`。是否复用连接只由 daemon 决定：Windows 网关不使用 ControlMaster，非 Windows 网关通过 `-S`（SFTP 为 `-o ControlPath=`）使用 daemon 自有的连接池（见下文）
 - 禁用管理员配置注入的 `RemoteCommand`，固定普通 session 类型
 - `-T`，不分配 PTY；Linux/macOS legacy 单行命令使用 `-n` 关闭远端 stdin；结构化 Bash 及 Windows PowerShell/cmd 包装脚本只通过一次受管 stdin 发送有界 payload
 
 这些约束写在 daemon 生成且 ACL 受保护的 wrapper `ssh_config` 中，并位于管理员配置之前；OpenSSH 的首次取值规则使它们同时约束最终目标和 `ProxyJump` 跳板目标。wrapper 不全局设置 `StdinNull`，因为 ProxyJump 子进程需要标准输入输出承载隧道。结构化执行只允许平台固定入口：Windows 为 PowerShell 或经 PowerShell 启动的临时 cmd 脚本，Linux/macOS 为 `bash --noprofile --norc -s`。调用方不能选择任意本机/远端 shell 可执行文件，也不能把交互输入继续转发到远端。
+
+连接池只在非 Windows 网关上启用（runtime 目录路径过长，或含空白、`%`、`~`、`$` 时也不启用）。Win32-OpenSSH 不支持 ControlMaster，因此 Windows 网关上的命令固定使用 `-S none`、SFTP 固定使用 `ControlPath=none`，每条命令和每次 SFTP 都单独建立并认证连接。非 Windows 网关上，daemon 为每个 OpenSSH 目标启动一个后台 control master（`-M -N -f`，`ControlPersist=600`），它使用同一套加固选项（仅省略与 `-M -N -f` 冲突的会话选项），另加 `ServerAliveInterval=15` 和 `ServerAliveCountMax=3`。socket 放在 runtime 目录下为每个配置 generation 新建的私有目录（0700）中，热加载后不会复用旧 generation 认证过的连接；热加载、目标移除和 daemon 关闭时会停止对应的 master。命令通过 `-S <socket>`、SFTP 通过 `-o ControlPath=<socket>` 作为客户端复用 master，并固定 `ControlMaster=no`；master 缺失或失效时回退为完整认证的直接连接。master 存活期间，能访问该 socket 的同账户进程无需私钥即可经它开启到目标的会话，这仍属于同一账户的信任边界。AccessClient 和 Tailscale 目标不使用连接池。
 
 AccessClient 适配器只复用 PuTTY 已存在的共享连接。每个配置 generation 中，每台 AccessClient 目标最多持有一条 Plink 下游会话；同一目标严格 FIFO，不同目标可并行。Plink 固定使用 `-batch -share -loghost <sharingHost> -noagent -a -x -no-trivial-auth`、一个必定失败的 `-proxycmd` 和一个故意不匹配的 `-hostkey`；最终连接参数仍是独立保存的物理网关 host。共享连接不存在或执行期间消失时，因此不能降级为普通 SSH 认证。旧配置未保存 `sharingHost` 时继续使用物理网关 host，避免改变既有共享会话的选择语义。
 
@@ -100,7 +102,7 @@ gateway 注入 OpenSSH 配置语境的管理员 config 与 known-hosts 路径禁
 
 allow-list 按 UTF-8 字符串精确匹配整条 legacy 命令，命令不能包含 NUL 或换行。不接受正则、通配符或参数模板；远端命令仍由远端 shell 解释，因此每个允许项都必须按可执行代码审查，避免命令替换、重定向和 shell 运算符扩大权限。allow-list 不允许结构化 `cwd`、`env` 或多行 `script`，因为这些上下文无法由现有精确单行白名单安全表示。
 
-`mode: full-access` 必须按目标显式配置。它允许 Agent 在该远端账户权限内执行任意单行命令或结构化多行脚本；OpenSSH 目标还允许在 Gateway 本机与远端合法绝对路径之间双向传输，AccessClient 目标的传输能力固定为 `deny`。Full access 可读取、修改或删除远端数据、安装软件和创建持久化；它不是沙箱，也不提供命令级或路径级最小权限。结构化 shell 名虽然固定，脚本正文仍是任意远端代码；`cwd` 和 `env` 只减少转义成本，不降低权限。应使用专用低权限 Gateway 账户与远端账户、目录/服务 ACL、容器或虚拟机限制影响范围，并只在确实需要开放式运维时启用。
+`mode: full-access` 必须按目标显式配置。它允许 Agent 在该远端账户权限内执行任意单行命令或结构化多行脚本；OpenSSH 和 AccessClient 目标还允许在 Gateway 本机与远端合法绝对路径之间双向传输（AccessClient 经共享 shell），因此 Agent 能读到网关本机上 Gateway 运行账户可读的任何文件。Full access 可读取、修改或删除远端数据、安装软件和创建持久化；它不是沙箱，也不提供命令级或路径级最小权限。结构化 shell 名虽然固定，脚本正文仍是任意远端代码；`cwd` 和 `env` 只减少转义成本，不降低权限。应使用专用低权限 Gateway 账户与远端账户、目录/服务 ACL、容器或虚拟机限制影响范围，并只在确实需要开放式运维时启用。
 
 `mode: deny` 永远拒绝执行，可用于保留但冻结目标。禁用目标不会暴露内部 `sshAlias`。
 
@@ -118,7 +120,7 @@ allow-list 按 UTF-8 字符串精确匹配整条 legacy 命令，命令不能包
 
 ## 文件传输
 
-OpenSSH 受限目标的文件传输使用独立于命令 allow-list 的 fail-closed 授权，默认 `transfer.mode: deny`。管理员必须显式选择 `upload`、`download` 或 `bidirectional`，同时授权命名本机根目录、远端绝对路径根目录、单文件/总字节/文件数配额和最大超时；`upload` 模式同时允许本机到远端的目录同步，`download` 不允许反向上传。OpenSSH Full access 目标的有效传输权限固定为 `bidirectional` 和全部合法绝对路径；旧配置中的传输方向和根目录不会缩小该范围。AccessClient 目标无论命令策略为何都固定为 `deny`，任何上传、下载或同步请求都会在授权层失败。实际 OpenSSH Gateway `transfer` 块中的配额和超时仍会生效，没有该块时使用默认配额和最长 3,600,000 毫秒超时。
+OpenSSH 受限目标的文件传输使用独立于命令 allow-list 的 fail-closed 授权，默认 `transfer.mode: deny`。管理员必须显式选择 `upload`、`download` 或 `bidirectional`，同时授权命名本机根目录、远端绝对路径根目录、单文件/总字节/文件数配额和最大超时；`upload` 模式同时允许本机到远端的目录同步，`download` 不允许反向上传。OpenSSH 和 AccessClient 的 Full access 目标的有效传输权限都固定为 `bidirectional` 和全部合法绝对路径；旧配置中的传输方向和根目录不会缩小该范围。AccessClient 目标只能经 Full access 获得传输能力：管理中心和低层配置都要求 AccessClient 目标的 `transfer.mode` 为 `deny`，所以其他命令策略下的上传、下载或同步请求都会在授权层失败。Full access 时，AccessClient 传输经该目标的受管 Plink 共享 shell 分块执行，与该目标的命令共用同一个 FIFO 队列；路径检查、partial 和校验和流程与 OpenSSH 相同。这意味着 AccessClient Full access 与 OpenSSH Full access 一样，让 Agent 能读到网关本机上 Gateway 运行账户可读的任何文件，并写入该账户可写的位置。Tailscale SSH 目标的传输在任何模式下都关闭。目标 `transfer` 块中的配额和超时仍会生效，没有该块时使用默认配额和最长 3,600,000 毫秒超时。
 
 受限调用只能提交本机根目录别名和相对 `localPath`，不会看到该别名对应的绝对路径。Full access 调用可以省略 `localRoot`，但此时 `localPath` 必须是 Gateway 本机原生绝对路径；提供 `localRoot` 时仍按兼容的根目录加相对路径形式处理。受限远端路径必须位于授权根目录内，Full access 远端路径可以位于目标账户可访问的任意正常文件系统根下。两种模式都拒绝符号链接/reparse point、非常规文件、Windows device/UNC 路径和不规范远端绝对路径；受限相对路径还拒绝 `..` 和根目录逃逸。上传会预检目标和 partial 的所有现存远端祖先，下载会在读取远端指纹时做同类检查；当时观察到 symlink、junction 或其他 reparse point 时会 fail closed。SFTP 只接收 Gateway 生成、长度有界且逐字段转义的 batch，不接受调用方提供的原始 SFTP 命令。
 
