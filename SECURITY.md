@@ -116,7 +116,7 @@ allow-list 按 UTF-8 字符串精确匹配整条 legacy 命令，命令不能包
 
 任务句柄不绑定某个 MCP 客户端身份。同一 Gateway 信任边界内，任何已认证且获得 `runId` 的调用方都可以执行 `status`、`tail` 或 `cancel`；因此 `runId` 不应写入公开日志。任务状态和日志只在内存中按 TTL 保留，daemon 重启后旧句柄失效。daemon 正常关闭会取消并等待活动任务；异常退出仍依赖 Job Object 清理本机 SSH/SFTP 进程树。
 
-`ssh_tail` 使用不透明 cursor 返回有界滚动 stdout/stderr。消费者必须检查 `droppedBytes` 和 `hadDecodingErrors`，不能假定从任意旧 cursor 都能恢复完整日志。取消和超时是协作式任务终态：Gateway 会中止本机受管进程，但远端已主动脱离 SSH 会话的进程仍可能继续。
+`ssh_tail` 使用不透明 cursor 返回有界滚动 stdout/stderr。消费者必须检查 `droppedBytes` 和 `hadDecodingErrors`，不能假定从任意旧 cursor 都能恢复完整日志；`droppedBytes` 表示滚动缓冲丢弃的旧字节，与落盘保留的 `retentionTruncated`/`retentionDroppedBytes` 是不同语义。取消和超时是协作式任务终态：Gateway 会中止本机受管进程，但远端已主动脱离 SSH 会话的进程仍可能继续；因超时或取消结束的任务保留已收到的输出和滚动日志。
 
 ## 文件传输
 
@@ -126,7 +126,7 @@ OpenSSH 受限目标的文件传输使用独立于命令 allow-list 的 fail-clo
 
 上传前把本机源文件复制到私有 spool，并在复制期间核对文件身份和 SHA-256，避免把已校验路径直接交给另一个进程造成 TOCTOU。上传写入内容寻址的远端 partial，校验后再发布；下载写入与目标/路径/hash 绑定的私有 partial，校验后再发布到本机目的路径。`resume` 会保留或复用 partial，但校验不一致时回退到完整传输。`overwrite: true` 明确允许替换目标，具有破坏性。Full access 只扩大合法路径范围，不会绕过单文件/总字节/文件数配额、超时、校验和、受控 partial 发布、取消、进程清理或审计。
 
-`dryRun` 保证不发布目标数据，但仍可能扫描/读取本机文件、计算哈希、查询远端文件哈希或检查目标状态。Full access 因此可以读取或覆盖 Gateway 运行账户能够访问的本机私钥、云凭据、配置、源代码和用户文件；隐藏 SSH 凭据配置并不能阻止 Agent 通过已授权的全路径文件工具读取其他可访问文件。生产部署应让 Gateway 使用专用低权限 Windows 账户，并用 ACL 把运行目录、私钥和其他敏感数据与可传输工作区隔离。`ssh_sync` 仅做本机到远端的单向文件同步，不删除远端多余文件；排除规则和 `verifyExisting` 只影响扫描、跳过与覆盖判断，不能扩大受限目标的授权范围。stdout、任务结果和传输审计只返回通用进度及计数，不应加入实际本机绝对路径或凭据。
+`dryRun` 保证不发布目标数据，但仍可能扫描/读取本机文件、计算哈希、查询远端文件哈希或检查目标状态。Full access 因此可以读取或覆盖 Gateway 运行账户能够访问的本机私钥、云凭据、配置、源代码和用户文件；隐藏 SSH 凭据配置并不能阻止 Agent 通过已授权的全路径文件工具读取其他可访问文件。生产部署应让 Gateway 使用专用低权限 Windows 账户，并用 ACL 把运行目录、私钥和其他敏感数据与可传输工作区隔离。`ssh_sync` 仅做本机到远端的单向文件同步，不删除远端多余文件；默认 `onExisting: "skip-identical"` 让重复同步跳过内容一致的远端文件，内容不同的文件记为冲突（任务日志只记录相对路径）而不中止任务；`"overwrite"` 明确替换内容不同的文件，`"fail"` 恢复遇到已存在文件即失败的严格语义。旧 `overwrite`/`verifyExisting` 参数按固定规则映射（`overwrite: true` 等价 `"overwrite"`，其余走默认），`onExisting` 与矛盾的 `overwrite: true` 组合会被校验拒绝；这些选项只影响扫描、跳过与覆盖判断，不能扩大受限目标的授权范围。本机枚举遇到符号链接或 junction 时默认跳过且绝不跟随（`links: "fail"` 则报出相对路径后失败）；远端路径与祖先的链接检查不变。stdout、任务结果和传输审计只返回通用进度及计数，不应加入实际本机绝对路径或凭据。
 
 ## 机器信息与 Docker 预检
 
@@ -142,7 +142,7 @@ Windows supervisor 在挂起状态创建 `ssh.exe`，先加入带 `KILL_ON_JOB_C
 
 ## 输出与审计
 
-stdout/stderr 可能包含敏感数据。同步执行的内联结果会返回调用方，每个流的内联预览硬上限为 8 KiB；超出后完整内容写入受保护运行目录，以随机 256-bit `outputRef` 读取并按 TTL 清理。为了兼容已有 managed revision，配置仍可包含历史上更高的 `inlineOutputBytes`，但 OutputStore 会在产生 RPC 结果前强制收紧到 8 KiB。`ssh_read_output` 返回原始 Base64，`ssh_read_output_text` 默认使用绑定输出引用、流和位置的不透明 cursor，并在 UTF-8 完整字符边界分页；显式传入的旧字节偏移若落在合法字符中间会前移到字符末尾。文本接口会报告真正的不合法字节，调用方不能把 `hadDecodingErrors` 的输出当成可信文本。长任务另有内存滚动日志，通过 `ssh_tail` 的不透明 cursor 读取。单次执行上限之外，所有活动写入与 retained output 还共享全局字节和条目配额；并发 append 会先原子计入配额，删除、过期、abort 或只返回内联结果时归还。启动扫描会核对 metadata 与实际规范文件的大小，损坏项不会进入配额账本。调用方不应把结果转发给不受信任的模型、日志或用户。
+stdout/stderr 可能包含敏感数据。同步执行的内联结果会返回调用方，每个流的内联预览硬上限为 8 KiB；超出后完整内容写入受保护运行目录，以随机 256-bit `outputRef` 读取并按 TTL 清理。为了兼容已有 managed revision，配置仍可包含历史上更高的 `inlineOutputBytes`，但 OutputStore 会在产生 RPC 结果前强制收紧到 8 KiB。`ssh_read_output` 返回原始 Base64，`ssh_read_output_text` 默认使用绑定输出引用、流和位置的不透明 cursor，并在 UTF-8 完整字符边界分页；显式传入的旧字节偏移若落在合法字符中间会前移到字符末尾。文本接口会报告真正的不合法字节，调用方不能把 `hadDecodingErrors` 的输出当成可信文本。长任务另有内存滚动日志，通过 `ssh_tail` 的不透明 cursor 读取。单次执行上限之外，所有活动写入与 retained output 还共享全局字节和条目配额；并发 append 会先原子计入配额，删除、过期、abort 或只返回内联结果时归还。达到单次上限或全局配额时 Gateway 停止继续落盘保留并在结果中标注 `retentionTruncated` 与未落盘的 `retentionDroppedBytes`，进程不会被终止，磁盘占用仍严格受原有单次和全局上限约束，`outputRef`（若存在）只包含已保留前缀；调用方不应把截断后的输出当作完整结果。同步执行因超时或取消结束时保留已收到的部分输出和 `outputRef`，便于诊断；只有显式设置了输出上限的操作（如预设操作的 256 KiB 上限和固定探针）才会以 `output_limit` 终止。启动扫描会核对 metadata 与实际规范文件的大小，损坏项不会进入配额账本。调用方不应把结果转发给不受信任的模型、日志或用户。
 
 审计 JSONL 只允许固定字段，使用服务端随机 `executionId` 关联事件，并记录命令/结构化 payload SHA-256、UTF-8 长度、目标公共别名、结果类型、退出码、时长和字节计数。它不记录客户端名、客户端 RPC request ID、原始命令/脚本/环境、stdout、stderr、token、路径或 `outputRef`。`exec.started` 必须落盘并同步成功后才会启动 SSH。传输审计只记录 `runId`、目标、方向、dry-run 标志、固定原因码和文件/字节计数。
 
