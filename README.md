@@ -9,7 +9,7 @@ Agent SSH Gateway 是一个运行在 Windows 本机、面向 Codex 和其他 AI 
 ## 能力概览
 
 - **三种连接方式**：OpenSSH 私钥、AccessClient/PuTTY 已登录共享会话，以及原生 Tailscale SSH。
-- **集中管理**：本机 Web 管理中心维护全局私钥库和最多 1,024 个目标；MCP 不暴露配置修改或私钥读取接口。
+- **集中管理与可选 MCP 接入**：本机 Web 管理中心维护全局私钥库和最多 1,024 个目标；默认情况下 MCP 仅做执行与观测，管理员在管理中心「全局设置 → MCP 管理权限」开启后（或使用 `--allow-mcp-admin` 启动服务），MCP 可在确认细节后自动完成接入机器、分组管理、密钥生成与连接检测等管理页面操作；MCP 始终不读取私钥正文、不导入本机私钥路径，也不能自行修改该开关。
 - **四档权限**：精确单行命令白名单（`allow-list`）、固定只读预设操作（`presets`）、`full-access` 和 `deny`，另有独立的目标启用开关。
 - **结构化执行**：Full access 目标支持固定 shell、工作目录、环境变量和多行脚本，不把脚本正文放进本机 `ssh.exe` 参数。
 - **可恢复长任务**：构建等任务由 daemon 持有，可跨 MCP 客户端断连继续运行，并支持增量日志、状态查询、取消和超时。
@@ -45,7 +45,7 @@ flowchart LR
 
 OpenSSH 连接复用和 Windows 目标的 PowerShell 预启动目前**只在非 Windows 网关上生效**。在非 Windows 网关上，daemon 为每个 OpenSSH 目标维持一个自有的 OpenSSH control master，命令和 SFTP 复用这条已认证的连接；Windows 目标还会在这条连接上预先启动一个 `powershell.exe`，留给下一条命令使用。Win32-OpenSSH 不支持 ControlMaster，所以在 Windows 网关（也就是当前唯一受支持的运行端）上这两项都不启用：每条命令、每次 SFTP 调用仍单独建立并认证 SSH 连接，远端 PowerShell 也是冷启动。AccessClient 和 Tailscale 目标不走这条路径。
 
-所有配置修改都在管理中心完成。保存配置时，服务会生成并校验新的不可变 revision；没有活动操作时，daemon 在原 Named Pipe 和 runtime token 上热加载新 generation，当前 MCP 进程无需重启。
+配置修改默认在 Web 管理中心完成；管理员开启「MCP 管理权限」开关后，也可由 AI Agent 通过 `ssh_admin_*` 工具完成机器接入与管理操作（见 [docs/mcp-admin.md](docs/mcp-admin.md)）。保存配置时，服务会生成并校验新的不可变 revision；没有活动操作时，daemon 在原 Named Pipe 和 runtime token 上热加载新 generation，当前 MCP 进程无需重启。
 
 ## 环境要求
 
@@ -98,10 +98,11 @@ Press Ctrl+C to stop.
 %LOCALAPPDATA%\agent-ssh-gateway\managed
 ```
 
-也可以指定目录和端口：
+也可以指定目录、端口，或通过 `--allow-mcp-admin` 在启动时强制开启 MCP 管理权限：
 
 ```powershell
 npm run start:service -- --managed-directory C:\AgentSsh\managed --port 8765
+npm run start:service -- --allow-mcp-admin
 ```
 
 产品入口默认使用固定端口 `52075`，显式指定 `--port 0` 时使用随机空闲端口。管理中心始终只监听 `127.0.0.1`。托管目录必须位于本地固定磁盘，不能是磁盘根、UNC/映射网络盘、device path、ADS 或包含 reparse point 的路径。
@@ -236,7 +237,7 @@ daemon 与 MCP 当前使用内部协议 v8，并严格校验版本。Gateway 尚
 
 ## MCP 工具
 
-当前共注册 24 个工具：
+当前共注册 36 个工具（24 个执行/观测/传输/组控工具 + 12 个默认关闭的管理中心工具）：
 
 | 工具 | 用途 |
 | --- | --- |
@@ -264,8 +265,20 @@ daemon 与 MCP 当前使用内部协议 v8，并严格校验版本。Gateway 尚
 | `ssh_docker_preflight` | 固定只读 Docker 部署预检 |
 | `ssh_read_output` | 以 Base64 分页读取同步执行的保留输出 |
 | `ssh_read_output_text` | 以 UTF-8 文本和不透明 cursor 读取保留输出 |
+| `ssh_admin_get_config` | 查看管理服务状态与 MCP 管理开关；开启后返回脱敏的机器、分组、公钥与全局配置 |
+| `ssh_admin_save_target` | 新增、修改或重命名机器（`full-access` 与受限文件传输须传确认标志） |
+| `ssh_admin_set_target_enabled` | 启停单台机器的 MCP 访问 |
+| `ssh_admin_remove_target` | 删除机器并撤销访问（须经用户确认并传 `removeConfirmed: true`） |
+| `ssh_admin_check_target` | 经管理中心检测连接，并在 AccessClient 首次连接成功时自动学习 `expectedHostname` |
+| `ssh_admin_manage_group` | 创建、重命名、删除、排序分组，或批量移动机器所属分组 |
+| `ssh_admin_generate_key` | 生成 Ed25519 / RSA 3072 托管密钥（仅返回公钥与指纹，不返回私钥） |
+| `ssh_admin_rename_key` | 重命名托管密钥标签 |
+| `ssh_admin_remove_key` | 删除未被任何活动/回滚 revision 引用的托管密钥（须传 `removeConfirmed: true`） |
+| `ssh_admin_launch_ssh_install` | 打开本机交互终端协助用户完成公钥安装（网关与 MCP 均不接触密码） |
+| `ssh_admin_save_provider_settings` | 保存全局 `tailscale.exe` 或 `plink.exe` 路径 |
+| `ssh_admin_accessclient_session` | 在 Windows 上准备、轮询状态或取消 AccessClient PuTTY 共享会话 |
 
-预设操作的用法见 [docs/permission-presets.md](docs/permission-presets.md)，分组与组控工具见 [docs/machine-groups.md](docs/machine-groups.md)。
+预设操作的用法见 [docs/permission-presets.md](docs/permission-presets.md)，分组与组控工具见 [docs/machine-groups.md](docs/machine-groups.md)，MCP 机器接入与管理说明见 [docs/mcp-admin.md](docs/mcp-admin.md)。
 
 ### 执行命令
 
@@ -374,8 +387,8 @@ Full access 目标（OpenSSH 和 AccessClient）可省略 `localRoot`，直接�
 
 使用前请阅读 [SECURITY.md](SECURITY.md)。最重要的边界是：
 
-- 管理中心只监听 IPv4 loopback，并使用独立的短期 UI token；不要分享完整管理 URL。
-- MCP 只暴露执行和观测工具，不提供机器、权限或私钥的修改接口。
+- 管理中心只监听 IPv4 loopback，并使用独立的短期 UI token 与独立的 MCP 管理 token；不要分享完整管理 URL。
+- MCP 管理能力默认关闭，需由管理员在本机 Web 管理中心显式开启（或使用 `--allow-mcp-admin` 启动服务）。关闭时 MCP 仅做执行和观测；开启后仍禁止通过 MCP 读取私钥正文、导入本机私钥路径或修改该开关，高危变更要求显式确认。
 - OpenSSH 强制批处理、公钥认证、严格 host key 校验，并关闭密码回退、agent/X11/端口转发和交互 PTY。
 - `full-access` 不是沙箱。生产环境应使用专用低权限 Windows 账户和远端账户，并用 ACL、容器或虚拟机限制影响范围。
 - stdout/stderr 可能包含秘密；不要把敏感结果转发到不受信任的模型、日志或页面。
@@ -423,7 +436,7 @@ npm run start:test-ui -- --demo
 src/
   service/    产品服务入口与管理控制面描述符
   daemon/     Gateway 生命周期、IPC、配置 generation 与存储安全
-  mcp/        stdio MCP 服务和 24 个工具
+  mcp/        stdio MCP 服务和 36 个工具
   core/       目标授权、执行、任务、输出、探针与文件传输
   infra/      OpenSSH、Plink、SFTP、进程树、host key 与审计
   config/     严格 YAML 配置加载

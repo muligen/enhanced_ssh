@@ -278,7 +278,7 @@ export class GroupController {
 export function registerGroupTools(server: McpServer, factory: ClientFactory): void {
   const controller = new GroupController(factory);
   const result = (value: object) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], structuredContent: value as Record<string, unknown> });
-  server.registerTool("ssh_list_groups", { description: "List exact machine group names and immutable target IDs, including disabled members. Configure membership in the SSH management center.",
+  server.registerTool("ssh_list_groups", { description: "List exact machine group names and immutable target IDs, including disabled members. Configure membership in the SSH management center or via ssh_admin_manage_group when MCP management is enabled.",
     annotations: { readOnlyHint: true, idempotentHint: true } }, async () => result(await controller.list()));
   server.registerTool("ssh_group_cpu", { description: "Read CPU utilization on enabled members of one exact group using Windows/Linux/macOS read-only probes. Returns each machine, failures/skips, arithmetic and logical-core-weighted averages over successful samples. Preset targets require basic-inspection; other targets require full-access structured execution. concurrency bounds simultaneous probes.",
     inputSchema: groupCpuSchema, annotations: { readOnlyHint: true, openWorldHint: true } }, async (args, context) => result(await controller.cpu(args, context.mcpReq.signal)));

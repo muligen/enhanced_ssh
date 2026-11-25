@@ -11,6 +11,11 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BrowserSession } from "../service/browser-session.js";
+import {
+  McpAdminPolicyError,
+  createInMemoryMcpAdminPolicy,
+  type McpAdminPolicyStore,
+} from "../service/mcp-admin-policy.js";
 
 import { z } from "zod";
 
@@ -50,6 +55,7 @@ import {
   managedAccessClientSettingsSchema,
   managedTailscaleSettingsSchema,
   managedFleetTargetSchema,
+  managedRevisionSchema,
   managedSshKeyIdSchema,
   managedSshKeyGenerationAlgorithmSchema,
   managedSshKeyLabelSchema,
@@ -94,9 +100,6 @@ const setupApplyRequestSchema = z.union([
   allowListApplyRequestSchema,
   fullAccessApplyRequestSchema,
 ]);
-const managedRevisionSchema = z
-  .string()
-  .regex(/^r-[a-z0-9]+-[a-f0-9]{32}$/u);
 const adminTargetSaveFields = {
   alias: targetAliasSchema,
   previousAlias: targetAliasSchema.optional(),
@@ -158,6 +161,10 @@ const adminTargetSaveRequestSchema = z.strictObject({
 const adminTargetRemoveRequestSchema = z.strictObject({
   alias: targetAliasSchema,
   expectedRevision: managedRevisionSchema.optional(),
+  removeConfirmed: z.literal(true).optional(),
+});
+const adminMcpAdminSaveRequestSchema = z.strictObject({
+  enabled: z.boolean(),
 });
 const adminTargetEnabledRequestSchema = z.strictObject({
   alias: targetAliasSchema,
@@ -205,6 +212,7 @@ const adminKeyRenameRequestSchema = z.strictObject({
 const adminKeyRemoveRequestSchema = z.strictObject({
   keyId: managedSshKeyIdSchema,
   expectedKeyRevision: managedSshKeyRevisionSchema,
+  removeConfirmed: z.literal(true).optional(),
 });
 const adminSshInstallRequestSchema = z
   .strictObject({ target: managedFleetTargetSchema })
@@ -247,16 +255,51 @@ interface StaticAsset {
   readonly body: Buffer;
 }
 
+type ApiCaller = "browser" | "mcp";
+
+const MCP_ALLOWED_ADMIN_ROUTES: ReadonlySet<string> = new Set([
+  "/api/admin/bootstrap",
+  "/api/admin/target/save",
+  "/api/admin/target/remove",
+  "/api/admin/target/enabled",
+  "/api/admin/target/check",
+  "/api/admin/group/create",
+  "/api/admin/group/rename",
+  "/api/admin/group/delete",
+  "/api/admin/group/move",
+  "/api/admin/group/reorder",
+  "/api/admin/key/generate",
+  "/api/admin/key/rename",
+  "/api/admin/key/remove",
+  "/api/admin/ssh/install",
+  "/api/admin/tailscale/save",
+  "/api/admin/access-client/save",
+  "/api/admin/access-client/session/prepare",
+  "/api/admin/access-client/session/status",
+  "/api/admin/access-client/session/cancel",
+]);
+
+export interface AdminActionEvent {
+  readonly caller: ApiCaller;
+  readonly route: string;
+  readonly status: number;
+  readonly code?: string;
+}
+
 export interface TestUiServerOptions {
   readonly gatewayFactory: TestUiGatewayFactory;
   readonly mode: "demo" | "gateway" | "managed";
   readonly configurationService?: TestUiConfigurationService;
   readonly accessClientSessionPreparer?: AccessClientSessionPreparer;
+  readonly mcpAdminPolicy?: McpAdminPolicyStore;
+  readonly launchSshInstall?: (options: InteractiveSshInstallOptions) => void;
   readonly legacySetupRoutes?: boolean;
   readonly port?: number;
   readonly sessionToken?: string;
+  readonly mcpAdminToken?: string;
   readonly browserSessionSecret?: string;
   readonly assetDirectory?: string;
+  readonly onAdminAction?: (event: AdminActionEvent) => void;
   readonly onError?: (error: unknown) => void;
 }
 
@@ -264,6 +307,7 @@ export interface RunningTestUiServer {
   readonly origin: string;
   readonly url: string;
   readonly sessionToken: string;
+  readonly mcpAdminToken: string;
   readonly port: number;
   close(): Promise<void>;
 }
@@ -285,10 +329,19 @@ export async function startTestUiServer(
 ): Promise<RunningTestUiServer> {
   const port = validatePort(options.port ?? 0);
   const sessionToken = options.sessionToken ?? randomBytes(32).toString("base64url");
+  const mcpAdminToken = options.mcpAdminToken ?? randomBytes(32).toString("base64url");
   const browserSession = new BrowserSession(options.browserSessionSecret ?? randomBytes(32).toString("base64url"));
   if (!UI_TOKEN_PATTERN.test(sessionToken)) {
     throw new TypeError("sessionToken must be a 256-bit base64url value");
   }
+  if (!UI_TOKEN_PATTERN.test(mcpAdminToken)) {
+    throw new TypeError("mcpAdminToken must be a 256-bit base64url value");
+  }
+  if (mcpAdminToken === sessionToken) {
+    throw new TypeError("mcpAdminToken must be distinct from sessionToken");
+  }
+  const mcpAdminPolicy = options.mcpAdminPolicy ?? createInMemoryMcpAdminPolicy(false);
+  const exposeMcpAdminInBootstrap = options.mcpAdminPolicy !== undefined;
 
   const assetDirectory =
     options.assetDirectory ?? fileURLToPath(new URL("./public/", import.meta.url));
@@ -304,18 +357,42 @@ export async function startTestUiServer(
   let closed = false;
 
   const server = createServer((request, response) => {
-    void handleRequest(request, response).catch((error: unknown) => {
-      if (!(error instanceof HttpProblem)) {
-        options.onError?.(error);
-      }
-      writeProblem(response, toHttpProblem(error));
-    });
+    let callerForAudit: ApiCaller | undefined;
+    const routeForAudit = request.url ?? "";
+    void handleRequest(request, response, (caller) => {
+      callerForAudit = caller;
+    })
+      .then(() => {
+        if (callerForAudit !== undefined && routeForAudit.startsWith("/api/admin/")) {
+          options.onAdminAction?.({
+            caller: callerForAudit,
+            route: routeForAudit,
+            status: response.statusCode,
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        if (!(error instanceof HttpProblem)) {
+          options.onError?.(error);
+        }
+        const problem = toHttpProblem(error);
+        if (callerForAudit !== undefined && routeForAudit.startsWith("/api/admin/")) {
+          options.onAdminAction?.({
+            caller: callerForAudit,
+            route: routeForAudit,
+            status: problem.status,
+            code: problem.code,
+          });
+        }
+        writeProblem(response, problem);
+      });
   });
   configureHttpServer(server);
 
   const handleRequest = async (
     request: IncomingMessage,
     response: ServerResponse,
+    onAuthenticated?: (caller: ApiCaller) => void,
   ): Promise<void> => {
     applySecurityHeaders(response);
     if (request.headers.host !== expectedHost) {
@@ -342,8 +419,32 @@ export async function startTestUiServer(
     if (request.method !== "POST") {
       throw new HttpProblem(405, "METHOD_NOT_ALLOWED", "Method is not allowed");
     }
-    assertBrowserApiRequest(request, expectedOrigin, sessionToken, browserSession);
-    response.setHeader("Set-Cookie", browserSession.issue(expectedOrigin));
+    const caller = authenticateApiRequest(
+      request,
+      expectedOrigin,
+      sessionToken,
+      mcpAdminToken,
+      browserSession,
+    );
+    onAuthenticated?.(caller);
+    if (caller === "browser") {
+      response.setHeader("Set-Cookie", browserSession.issue(expectedOrigin));
+    } else if (route !== "/api/admin/mcp-admin/status") {
+      if (!MCP_ALLOWED_ADMIN_ROUTES.has(route)) {
+        throw new HttpProblem(
+          403,
+          "MCP_ADMIN_FORBIDDEN",
+          "This administrative operation is restricted to the local Web Management Center",
+        );
+      }
+      if (!mcpAdminPolicy.get().enabled) {
+        throw new HttpProblem(
+          403,
+          "MCP_ADMIN_DISABLED",
+          "MCP configuration management is disabled. Ask the administrator to enable it in the local Web Management Center or start agent-ssh-service with --allow-mcp-admin.",
+        );
+      }
+    }
     cleanupResultReferences(resultReferences);
 
     switch (route) {
@@ -626,14 +727,42 @@ export async function startTestUiServer(
         writeJson(
           response,
           200,
-          options.accessClientSessionPreparer === undefined
-            ? status
-            : {
-                ...status,
-                accessClientSession:
-                  options.accessClientSessionPreparer.status(),
-              },
+          {
+            ...status,
+            ...(options.accessClientSessionPreparer === undefined
+              ? {}
+              : {
+                  accessClientSession:
+                    options.accessClientSessionPreparer.status(),
+                }),
+            ...(exposeMcpAdminInBootstrap || caller === "mcp"
+              ? { mcpAdmin: mcpAdminPolicy.get() }
+              : {}),
+          },
         );
+        return;
+      }
+      case "/api/admin/mcp-admin/status": {
+        emptyBodySchema.parse(await readJsonBody(request));
+        requireFleetConfigurationService(options);
+        writeJson(response, 200, mcpAdminPolicy.get());
+        return;
+      }
+      case "/api/admin/mcp-admin/save": {
+        if (caller !== "browser") {
+          throw new HttpProblem(
+            403,
+            "MCP_ADMIN_FORBIDDEN",
+            "This administrative operation is restricted to the local Web Management Center",
+          );
+        }
+        const saveRequest = adminMcpAdminSaveRequestSchema.parse(
+          await readJsonBody(request),
+        );
+        requireFleetConfigurationService(options);
+        writeJson(response, 200, {
+          mcpAdmin: await mcpAdminPolicy.setEnabled(saveRequest.enabled),
+        });
         return;
       }
       case "/api/admin/key/generate": {
@@ -724,6 +853,13 @@ export async function startTestUiServer(
         const keyRequest = adminKeyRemoveRequestSchema.parse(
           await readJsonBody(request),
         );
+        if (caller === "mcp" && keyRequest.removeConfirmed !== true) {
+          throw new HttpProblem(
+            400,
+            "CONFIRMATION_REQUIRED",
+            "Removing an SSH key via MCP requires removeConfirmed: true after explicit user confirmation",
+          );
+        }
         const configuration = requireFleetConfigurationService(options);
         assertConfigurationMutationAvailable(
           activeRun,
@@ -759,7 +895,7 @@ export async function startTestUiServer(
         if (key === undefined) {
           throw new HttpProblem(409, "KEY_NOT_FOUND", "The selected SSH key is unavailable");
         }
-        launchInteractiveSshInstall({
+        (options.launchSshInstall ?? launchInteractiveSshInstall)({
           host: target.target.host,
           port: target.target.port,
           username: target.target.username,
@@ -1154,6 +1290,13 @@ export async function startTestUiServer(
         const removeRequest = adminTargetRemoveRequestSchema.parse(
           await readJsonBody(request),
         );
+        if (caller === "mcp" && removeRequest.removeConfirmed !== true) {
+          throw new HttpProblem(
+            400,
+            "CONFIRMATION_REQUIRED",
+            "Removing a target via MCP requires removeConfirmed: true after explicit user confirmation",
+          );
+        }
         const configuration = requireFleetConfigurationService(options);
         assertConfigurationMutationAvailable(
           activeRun,
@@ -1353,6 +1496,7 @@ export async function startTestUiServer(
     origin,
     url: `${origin}/#token=${sessionToken}`,
     sessionToken,
+    mcpAdminToken,
     port: address.port,
     async close(): Promise<void> {
       if (closed) {
@@ -1422,12 +1566,44 @@ function applySecurityHeaders(response: ServerResponse): void {
   response.setHeader("X-Frame-Options", "DENY");
 }
 
-function assertBrowserApiRequest(
+function authenticateApiRequest(
   request: IncomingMessage,
   expectedOrigin: string,
   sessionToken: string,
+  mcpAdminToken: string,
   browserSession: BrowserSession,
-): void {
+): ApiCaller {
+  const providedMcpToken = request.headers["x-agent-ssh-mcp-token"];
+  if (providedMcpToken !== undefined) {
+    if (
+      request.headers.origin !== undefined ||
+      request.headers["sec-fetch-site"] !== undefined ||
+      request.headers.cookie !== undefined ||
+      request.headers["x-agent-ssh-ui-token"] !== undefined
+    ) {
+      throw new HttpProblem(
+        403,
+        "INVALID_MCP_REQUEST",
+        "MCP admin requests must not include browser session headers",
+      );
+    }
+    if (
+      typeof providedMcpToken !== "string" ||
+      !constantTimeTextEquals(providedMcpToken, mcpAdminToken)
+    ) {
+      throw new HttpProblem(
+        403,
+        "INVALID_SESSION",
+        "MCP admin session was rejected",
+      );
+    }
+    const contentType = request.headers["content-type"]?.split(";", 1)[0]?.trim();
+    if (contentType !== "application/json") {
+      throw new HttpProblem(415, "JSON_REQUIRED", "Content-Type must be application/json");
+    }
+    return "mcp";
+  }
+
   if (request.headers.origin !== expectedOrigin) {
     throw new HttpProblem(403, "INVALID_ORIGIN", "Request origin was rejected");
   }
@@ -1446,6 +1622,7 @@ function assertBrowserApiRequest(
   if (contentType !== "application/json") {
     throw new HttpProblem(415, "JSON_REQUIRED", "Content-Type must be application/json");
   }
+  return "browser";
 }
 
 function constantTimeTextEquals(left: string, right: string): boolean {
@@ -1640,6 +1817,9 @@ function toHttpProblem(error: unknown): HttpProblem {
     return new HttpProblem(error.status, error.code, error.message);
   }
   if (error instanceof AccessClientSessionError) {
+    return new HttpProblem(error.status, error.code, error.message);
+  }
+  if (error instanceof McpAdminPolicyError) {
     return new HttpProblem(error.status, error.code, error.message);
   }
   return new HttpProblem(500, "INTERNAL_ERROR", "Test UI request failed");
@@ -1990,7 +2170,7 @@ function statusForGatewayCode(code: string | undefined): number {
   }
 }
 
-interface InteractiveSshInstallOptions {
+export interface InteractiveSshInstallOptions {
   readonly host: string;
   readonly port: number;
   readonly username: string;

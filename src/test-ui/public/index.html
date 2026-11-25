@@ -742,6 +742,35 @@ Linux/macOS: /srv/services" rows="4" spellcheck="false"></textarea>
           </div>
         </section>
 
+        <section aria-labelledby="mcp-admin-settings-heading" class="form-section settings-mcp-admin">
+          <div class="section-heading mcp-admin-settings-heading">
+            <span aria-hidden="true" class="section-icon"><svg class="ui-icon" fill="none" focusable="false" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" viewBox="0 0 24 24"><path d="M12 3 5 6v6c0 4.5 3 7.8 7 9 4-1.2 7-4.5 7-9V6l-7-3Z"></path><path d="m9.5 12 1.8 1.8 3.7-3.8"></path></svg></span>
+            <div>
+              <h3 id="mcp-admin-settings-heading">MCP 管理权限</h3>
+              <p>控制 AI Agent 是否可通过 MCP 接入机器、修改权限及管理分组和私钥。默认关闭，变更即时生效。</p>
+            </div>
+            <span class="state-badge is-draft" id="mcp-admin-settings-badge">已关闭</span>
+          </div>
+          <div class="section-body">
+            <div class="inline-alert is-error key-alert" hidden="" id="mcp-admin-settings-error" role="alert"></div>
+            <div aria-live="polite" class="inline-alert key-alert" hidden="" id="mcp-admin-settings-status" role="status"></div>
+            <div class="mcp-admin-toggle-row">
+              <label class="switch-control mcp-admin-switch-control">
+                <input id="mcp-admin-enabled" name="mcp-admin-enabled" type="checkbox"/>
+                <span aria-hidden="true" class="switch-track"></span>
+                <span>允许 MCP 管理机器与配置</span>
+              </label>
+            </div>
+            <div class="connection-status-line mcp-admin-session-note">
+              <span aria-hidden="true" class="status-dot is-idle" id="mcp-admin-settings-dot"></span>
+              <div>
+                <strong id="mcp-admin-settings-label">已关闭（默认）</strong>
+                <p id="mcp-admin-settings-detail">关闭时 MCP 仅执行和观测，拒绝配置修改。开启后，配置完全访问、开启文件传输或删除机器/私钥仍需用户显式确认；MCP 绝不能读取私钥正文、导入本机私钥路径或自行修改此开关。</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section aria-labelledby="appearance-heading" class="form-section settings-appearance">
           <div class="section-heading">
             <span aria-hidden="true" class="section-icon"><svg class="ui-icon" fill="none" focusable="false" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 0 18c1.1 0 1.8-.9 1.8-1.9 0-.5-.2-.9-.5-1.3-.3-.3-.5-.8-.5-1.3 0-1 .8-1.8 1.8-1.8H17a4 4 0 0 0 4-4C21 6.6 17 3 12 3Z"></path><circle cx="7.5" cy="11" r="1"></circle><circle cx="10" cy="7" r="1"></circle><circle cx="15" cy="7.5" r="1"></circle></svg></span>
@@ -814,6 +843,7 @@ Linux/macOS: /srv/services" rows="4" spellcheck="false"></textarea>
               <tr><th scope="row">文件传输</th><td><code>ssh_upload</code> · <code>ssh_download</code><br/><code>ssh_sync</code></td><td>“把本机项目同步到远端，排除 node_modules，先 dryRun。”本机路径指运行网关的电脑。上传、下载支持校验和及续传参数；sync 为本机到远端的单向目录同步，不删除远端多余文件。OpenSSH 使用 SFTP，AccessClient 复用共享 shell；按授权目录执行，用 runId 跟踪。</td></tr>
               <tr><th scope="row">环境与部署预检</th><td><code>ssh_target_info</code><br/><code>ssh_docker_preflight</code></td><td>“确认机器身份、Docker 状态和剩余磁盘，检查部署端口。”Docker 预检目前需要完全访问权限，只检查，不安装或部署；提供项目名与 create / update / inspect 意图可区分本项目占用。</td></tr>
               <tr><th scope="row">大输出读取</th><td><code>ssh_read_output_text</code><br/><code>ssh_read_output</code></td><td>输出预览截断时，用返回的 outputRef 分页读取。文本优先使用文本接口；原始接口返回 Base64 数据。</td></tr>
+              <tr><th scope="row">机器接入与管理</th><td><code>ssh_admin_get_config</code> · <code>ssh_admin_save_target</code><br/><code>ssh_admin_set_target_enabled</code> · <code>ssh_admin_remove_target</code><br/><code>ssh_admin_check_target</code> · <code>ssh_admin_manage_group</code><br/><code>ssh_admin_generate_key</code> · <code>ssh_admin_rename_key</code><br/><code>ssh_admin_remove_key</code> · <code>ssh_admin_launch_ssh_install</code><br/><code>ssh_admin_save_provider_settings</code> · <code>ssh_admin_accessclient_session</code></td><td>默认关闭，需先在「全局设置 → MCP 管理权限」开启（或使用 <code>--allow-mcp-admin</code> 启动服务）。开启后可由 AI 先询问细节再自动接入机器、管理分组与生成密钥；完全访问、文件传输、删除机器/密钥须经用户确认，私钥正文与导入路径不向 MCP 开放。</td></tr>
               </tbody></table></div>
               <p>分组任务返回 <code>groupRunId</code>，每台机器另有 <code>runId</code>。分组协调依赖当前 MCP 进程，完成后的组记录保留 24 小时；MCP 重启会丢失组记录及未派发队列，已派发任务可继续用各自 runId 查询或取消。取消分组后仍需查询最终状态。</p>
             </div>

@@ -3,6 +3,7 @@
 import path from "node:path";
 import process from "node:process";
 import { loadBrowserSessionSecret } from "./browser-session.js";
+import { loadMcpAdminPolicy } from "./mcp-admin-policy.js";
 
 import { GATEWAY_VERSION } from "../shared/version.js";
 import {
@@ -27,12 +28,13 @@ interface ServiceArguments {
   readonly action: "run" | "help" | "version";
   readonly managedDirectory: string;
   readonly port: number;
+  readonly allowMcpAdmin: boolean;
 }
 
 function usage(): string {
   return [
     "Usage:",
-    "  agent-ssh-service [--managed-directory PATH] [--port PORT]",
+    "  agent-ssh-service [--managed-directory PATH] [--port PORT] [--allow-mcp-admin]",
   ].join("\n");
 }
 
@@ -42,6 +44,7 @@ function parseArguments(argv: readonly string[]): ServiceArguments {
       action: "help",
       managedDirectory: defaultManagedSshDirectory(),
       port: 0,
+      allowMcpAdmin: false,
     };
   }
   if (argv.length === 1 && argv[0] === "--version") {
@@ -49,12 +52,14 @@ function parseArguments(argv: readonly string[]): ServiceArguments {
       action: "version",
       managedDirectory: defaultManagedSshDirectory(),
       port: 0,
+      allowMcpAdmin: false,
     };
   }
 
   let managedDirectory = defaultManagedSshDirectory();
   let managedDirectorySpecified = false;
   let port = 52075;
+  let allowMcpAdmin = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--managed-directory") {
@@ -76,9 +81,16 @@ function parseArguments(argv: readonly string[]): ServiceArguments {
       }
       continue;
     }
+    if (argument === "--allow-mcp-admin") {
+      if (allowMcpAdmin) {
+        throw new Error("--allow-mcp-admin may only be specified once");
+      }
+      allowMcpAdmin = true;
+      continue;
+    }
     throw new Error(`Unknown argument: ${argument ?? "<missing>"}\n${usage()}`);
   }
-  return { action: "run", managedDirectory, port };
+  return { action: "run", managedDirectory, port, allowMcpAdmin };
 }
 
 function requireValue(option: string, value: string | undefined): string {
@@ -112,16 +124,28 @@ async function run(args: ServiceArguments): Promise<void> {
   let descriptor: AdminDescriptor | undefined;
   let runError: unknown;
   try {
+    const mcpAdminPolicy = await loadMcpAdminPolicy(args.managedDirectory, {
+      forceEnabledByCli: args.allowMcpAdmin,
+    });
     server = await startTestUiServer({
       browserSessionSecret: await loadBrowserSessionSecret(args.managedDirectory),
       gatewayFactory: configurationService.gatewayFactory,
       configurationService,
+      mcpAdminPolicy,
       ...(accessClientSessionPreparer === undefined
         ? {}
         : { accessClientSessionPreparer }),
       mode: "managed",
       legacySetupRoutes: false,
       port: args.port,
+      onAdminAction: (event) => {
+        if (event.caller === "mcp" && event.route !== "/api/admin/mcp-admin/status") {
+          const suffix = event.code === undefined ? "" : ` (${event.code})`;
+          process.stderr.write(
+            `agent-ssh-service mcp-admin: ${event.route} -> ${event.status}${suffix}\n`,
+          );
+        }
+      },
       onError: (error) => {
         const name = error instanceof Error ? error.name : "UnknownError";
         process.stderr.write(`agent-ssh-service warning: ${name}\n`);
@@ -133,11 +157,19 @@ async function run(args: ServiceArguments): Promise<void> {
       origin: server.origin,
       url: server.url,
       startedAt: new Date().toISOString(),
+      mcpAdminToken: server.mcpAdminToken,
     };
     await publishAdminDescriptor(runtimeDirectory, descriptor);
 
+    const policySnapshot = mcpAdminPolicy.get();
+    const mcpAdminSummary = policySnapshot.enabled
+      ? policySnapshot.source === "cli"
+        ? "enabled (--allow-mcp-admin)"
+        : "enabled (saved setting)"
+      : "disabled (enable in Web Management Center -> Settings)";
     process.stdout.write(`Agent SSH management center: ${server.url}\n`);
     process.stdout.write(`Gateway runtime: ${runtimeDirectory}\n`);
+    process.stdout.write(`MCP configuration management: ${mcpAdminSummary}\n`);
     process.stdout.write("Press Ctrl+C to stop.\n");
     await waitForStopSignal();
   } catch (error) {

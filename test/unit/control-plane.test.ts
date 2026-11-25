@@ -12,6 +12,7 @@ import {
 } from "../../src/service/control-plane.js";
 
 const TEST_TOKEN = "A".repeat(43);
+const TEST_MCP_TOKEN = "B".repeat(43);
 
 test("admin descriptor round-trips only while its service process is alive", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agent-ssh-admin-"));
@@ -23,6 +24,7 @@ test("admin descriptor round-trips only while its service process is alive", asy
     origin: "http://127.0.0.1:43123",
     url: `http://127.0.0.1:43123/#token=${TEST_TOKEN}`,
     startedAt: new Date().toISOString(),
+    mcpAdminToken: TEST_MCP_TOKEN,
   };
   try {
     await publishAdminDescriptor(dataDirectory, descriptor);
@@ -34,7 +36,7 @@ test("admin descriptor round-trips only while its service process is alive", asy
   }
 });
 
-test("admin descriptor rejects non-loopback and untokenized URLs", async () => {
+test("admin descriptor rejects non-loopback, untokenized, or colliding MCP tokens", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agent-ssh-admin-"));
   const dataDirectory = path.join(root, "runtime");
   try {
@@ -63,6 +65,26 @@ test("admin descriptor rejects non-loopback and untokenized URLs", async () => {
         origin: "http://127.0.0.1:43123",
         url: `http://operator:secret@127.0.0.1:43123/#token=${TEST_TOKEN}`,
         startedAt: new Date().toISOString(),
+      }),
+    );
+    await assert.rejects(
+      publishAdminDescriptor(dataDirectory, {
+        version: 1,
+        pid: process.pid,
+        origin: "http://127.0.0.1:43123",
+        url: `http://127.0.0.1:43123/#token=${TEST_TOKEN}`,
+        startedAt: new Date().toISOString(),
+        mcpAdminToken: TEST_TOKEN,
+      }),
+    );
+    await assert.rejects(
+      publishAdminDescriptor(dataDirectory, {
+        version: 1,
+        pid: process.pid,
+        origin: "http://127.0.0.1:43123",
+        url: `http://127.0.0.1:43123/#token=${TEST_TOKEN}`,
+        startedAt: new Date().toISOString(),
+        mcpAdminToken: "too-short",
       }),
     );
   } finally {

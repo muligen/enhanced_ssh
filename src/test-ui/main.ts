@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { resolveDataDirectory } from "../shared/paths.js";
 import { GATEWAY_VERSION } from "../shared/version.js";
+import { loadMcpAdminPolicy } from "../service/mcp-admin-policy.js";
 import {
   createDemoGatewayFactory,
   createRpcGatewayFactory,
@@ -138,6 +139,10 @@ async function run(args: TestUiArguments): Promise<void> {
   let server: RunningTestUiServer | undefined;
   let runError: unknown;
   try {
+    const mcpAdminPolicy =
+      mode === "managed"
+        ? await loadMcpAdminPolicy(managedDirectory)
+        : undefined;
     const gatewayFactory =
       mode === "demo"
         ? createDemoGatewayFactory()
@@ -148,6 +153,7 @@ async function run(args: TestUiArguments): Promise<void> {
       gatewayFactory,
       mode,
       ...(configurationService === undefined ? {} : { configurationService }),
+      ...(mcpAdminPolicy === undefined ? {} : { mcpAdminPolicy }),
       ...(accessClientSessionPreparer === undefined
         ? {}
         : { accessClientSessionPreparer }),
