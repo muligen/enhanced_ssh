@@ -14,7 +14,7 @@ import {
   POSIX_BASH_REMOTE_COMMAND,
   WINDOWS_POWERSHELL_REMOTE_COMMAND,
 } from "../../src/core/remote-command.js";
-import { MAX_COMMAND_BYTES } from "../../src/shared/protocol.js";
+import { MAX_COMMAND_BYTES, MAX_TIMEOUT_MS } from "../../src/shared/protocol.js";
 import {
   FakeAuditWriter,
   FakeSshExecutor,
@@ -405,6 +405,254 @@ test("times out an execution and aborts its executor", async () => {
   const cancelled = audit.events[1];
   assert.ok(cancelled?.event === "exec.cancelled");
   assert.equal(cancelled.reasonCode, "timeout");
+});
+
+test("timed-out synchronous executions keep their partial output", async () => {
+  const started = deferred<SshRunInput>();
+  const outputStore = new MemoryOutputStore({
+    inlineBytesPerStream: 16,
+    maxStoredBytes: 64,
+  });
+  const audit = new FakeAuditWriter();
+  const executor = new FakeSshExecutor(async (input) => {
+    await input.outputSink?.append("stdout", Buffer.from("partial"));
+    started.resolve(input);
+    return outcomeAfterAbort(input, 25);
+  });
+  const service = testExecService({
+    executor,
+    outputStore,
+    audit,
+    registry: testRegistry(100),
+  });
+
+  const result = await service.run(caller, "timeout-partial-1", {
+    target: "alpha",
+    command: "long-command",
+    timeoutMs: 15,
+  });
+
+  assert.equal(result.termination, "timeout");
+  assert.equal(result.exitCode, null);
+  assert.deepEqual(result.stdout, {
+    text: "partial",
+    bytes: 7,
+    inlineTruncated: false,
+  });
+  assert.equal("outputRef" in result, false);
+  const completed = audit.events.at(-1);
+  assert.ok(completed?.event === "exec.completed");
+  assert.equal(completed.stdoutBytes, 7);
+});
+
+test("timed-out executions retain a readable outputRef prefix for truncated previews", async () => {
+  const started = deferred<SshRunInput>();
+  const outputStore = new MemoryOutputStore({
+    inlineBytesPerStream: 2,
+    maxStoredBytes: 64,
+  });
+  const executor = new FakeSshExecutor(async (input) => {
+    await input.outputSink?.append("stdout", Buffer.from("partial"));
+    started.resolve(input);
+    return outcomeAfterAbort(input, 25);
+  });
+  const service = testExecService({
+    executor,
+    outputStore,
+    registry: testRegistry(100),
+  });
+
+  const result = await service.run(caller, "timeout-partial-ref-1", {
+    target: "alpha",
+    command: "long-command",
+    timeoutMs: 15,
+  });
+
+  assert.equal(result.termination, "timeout");
+  assert.deepEqual(result.stdout, {
+    text: "pa",
+    bytes: 7,
+    inlineTruncated: true,
+  });
+  assert.match(result.outputRef ?? "", /^[A-Za-z0-9_-]{43}$/);
+  const page = await service.readOutput({
+    outputRef: result.outputRef!,
+    stream: "stdout",
+    offset: 0,
+    limit: 16,
+  });
+  assert.equal(
+    Buffer.from(page.dataBase64, "base64").toString("utf8"),
+    "partial",
+  );
+});
+
+test("cancelled synchronous executions keep their partial output", async () => {
+  const started = deferred<SshRunInput>();
+  const outputStore = new MemoryOutputStore({
+    inlineBytesPerStream: 16,
+    maxStoredBytes: 64,
+  });
+  const audit = new FakeAuditWriter();
+  const executor = new FakeSshExecutor(async (input) => {
+    await input.outputSink?.append("stderr", Buffer.from("half-way"));
+    started.resolve(input);
+    return outcomeAfterAbort(input);
+  });
+  const service = testExecService({ executor, outputStore, audit });
+
+  const execution = service.run(caller, "cancel-partial-1", {
+    target: "alpha",
+    command: "long-command",
+  });
+  await started.promise;
+  assert.equal(service.cancel(caller.sessionId, "cancel-partial-1"), true);
+  const result = await execution;
+
+  assert.equal(result.termination, "cancel");
+  assert.equal(result.exitCode, null);
+  assert.deepEqual(result.stderr, {
+    text: "half-way",
+    bytes: 8,
+    inlineTruncated: false,
+  });
+  const completed = audit.events.at(-1);
+  assert.ok(completed?.event === "exec.completed");
+  assert.equal(completed.stderrBytes, 8);
+});
+
+test("omitted timeoutMs falls back to the target cap for synchronous executions", async () => {
+  const started = deferred<SshRunInput>();
+  const executor = new FakeSshExecutor(async (input) => {
+    started.resolve(input);
+    return outcomeAfterAbort(input, 5);
+  });
+  const service = testExecService({ executor, registry: testRegistry(100) });
+
+  const execution = service.run(caller, "default-target-cap-1", {
+    target: "alpha",
+    command: "long-command",
+  });
+  await started.promise;
+  const result = await settlesWithin(execution);
+  assert.equal(result.termination, "timeout");
+});
+
+test("synchronous executions default to a 60 second cap when timeoutMs is omitted", async (t) => {
+  const started = deferred<SshRunInput>();
+  const executor = new FakeSshExecutor(async (input) => {
+    started.resolve(input);
+    return outcomeAfterAbort(input, 5);
+  });
+  const service = testExecService({
+    executor,
+    registry: testRegistry(MAX_TIMEOUT_MS),
+  });
+
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const execution = service.run(caller, "default-timeout-1", {
+    target: "alpha",
+    command: "long-command",
+  });
+  const input = await started.promise;
+  t.mock.timers.tick(59_999);
+  assert.equal(input.signal?.aborted, false);
+  t.mock.timers.tick(1);
+  const result = await settlesWithin(execution);
+  assert.equal(result.termination, "timeout");
+  assert.equal(input.signal?.aborted, true);
+});
+
+test("daemon-owned tasks keep the target maxTimeoutMs when timeoutMs is omitted", async (t) => {
+  const started = deferred<SshRunInput>();
+  const executor = new FakeSshExecutor(async (input) => {
+    started.resolve(input);
+    return outcomeAfterAbort(input, 5);
+  });
+  const service = testExecService({
+    executor,
+    registry: testRegistry(MAX_TIMEOUT_MS),
+  });
+  t.after(() => service.shutdown());
+
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const task = service.startTask({ target: "alpha", command: "long-command" });
+  const input = await started.promise;
+
+  t.mock.timers.tick(60_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(input.signal?.aborted, false);
+
+  t.mock.timers.tick(3_000_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(input.signal?.aborted, false);
+
+  t.mock.timers.tick(540_000);
+  let status = service.taskStatus(task.runId);
+  while (status.state === "running") {
+    t.mock.timers.tick(5);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    status = service.taskStatus(task.runId);
+  }
+  assert.equal(status.state, "timed_out");
+  assert.equal(status.termination, "timeout");
+  assert.equal(input.signal?.aborted, true);
+});
+
+test("a failing output sink racing a timeout stays quarantined and completes", async () => {
+  const started = deferred<SshRunInput>();
+  let abortCalls = 0;
+  let finalizeCalls = 0;
+  const sink: StoredOutputSink = {
+    append: () => Promise.reject(new Error("output storage exploded")),
+    finalize: () => {
+      finalizeCalls += 1;
+      return Promise.reject(new Error("fatal sink failure"));
+    },
+    cancel: () => undefined,
+    abort: () => {
+      abortCalls += 1;
+      return Promise.resolve();
+    },
+  };
+  const outputStore = {
+    create: async () => sink,
+  } as unknown as MemoryOutputStore;
+  const audit = new FakeAuditWriter();
+  const executor = new FakeSshExecutor(async (input) => {
+    void Promise.resolve(
+      input.outputSink?.append("stdout", Buffer.from("x")),
+    ).catch(() => undefined);
+    started.resolve(input);
+    return outcomeAfterAbort(input);
+  });
+  const service = testExecService({
+    executor,
+    outputStore,
+    audit,
+    registry: testRegistry(100),
+  });
+
+  const result = await settlesWithin(
+    service.run(caller, "sink-fail-timeout-1", {
+      target: "alpha",
+      command: "long-command",
+      timeoutMs: 15,
+    }),
+  );
+
+  assert.equal(result.termination, "timeout");
+  assert.deepEqual(result.stdout, {
+    text: "",
+    bytes: 0,
+    inlineTruncated: false,
+  });
+  assert.deepEqual(
+    audit.events.map((event) => event.event),
+    ["exec.started", "exec.cancelled", "exec.completed"],
+  );
+  assert.equal(abortCalls, 1);
+  assert.equal(finalizeCalls, 0);
 });
 
 test("cancels an execution by session and request ID", async () => {

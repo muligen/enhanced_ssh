@@ -7,6 +7,9 @@ export const PROTOCOL_VERSION = 8 as const;
 export const MAX_RPC_FRAME_BYTES = 1_048_576;
 export const MAX_COMMAND_BYTES = 65_536;
 export const MAX_TIMEOUT_MS = 3_600_000;
+// Synchronous `ssh_exec` uses this cap when the caller omits timeoutMs; long
+// tasks started with `task.start` still default to the target's maxTimeoutMs.
+export const DEFAULT_SYNC_EXEC_TIMEOUT_MS = 60_000;
 export const MAX_OUTPUT_READ_BYTES = 65_536;
 export const MAX_INLINE_PREVIEW_BYTES = 8_192;
 export const MAX_TARGET_CHECK_HOSTNAME_LENGTH = 255;

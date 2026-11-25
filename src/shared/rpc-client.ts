@@ -4,8 +4,8 @@ import net from "node:net";
 import { z } from "zod/v4";
 import { loadRuntimeDescriptor } from "../daemon/runtime-state.js";
 import {
+  DEFAULT_SYNC_EXEC_TIMEOUT_MS,
   MAX_RPC_FRAME_BYTES,
-  MAX_TIMEOUT_MS,
   PROTOCOL_VERSION,
   parseRpcResult,
   type ExecResult,
@@ -168,9 +168,13 @@ export class GatewayRpcClient {
     params: RpcParamsByMethod["exec.run"],
     signal?: AbortSignal,
   ): Promise<ExecResult> {
+    // Match the gateway's synchronous default: executions without timeoutMs
+    // are bounded by DEFAULT_SYNC_EXEC_TIMEOUT_MS on the server, so waiting
+    // for MAX_TIMEOUT_MS here would only prolong an already-dead request.
     const tracked = this.requestTracked("exec.run", params, {
       timeoutMs:
-        (params.timeoutMs ?? MAX_TIMEOUT_MS) + RPC_EXEC_RESPONSE_GRACE_MS,
+        (params.timeoutMs ?? DEFAULT_SYNC_EXEC_TIMEOUT_MS) +
+        RPC_EXEC_RESPONSE_GRACE_MS,
       onTimeout: (requestId) => {
         void this.request("exec.cancel", { requestId }).catch(() => undefined);
       },
