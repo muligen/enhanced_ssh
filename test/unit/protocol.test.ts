@@ -504,6 +504,44 @@ test("exec result requires retained output metadata for truncated previews", () 
   }
 });
 
+test("exec results carry optional retention truncation metadata", () => {
+  const base = {
+    requestId: "exec-retention-1",
+    termination: "exit",
+    exitCode: 0,
+    durationMs: 12,
+    stdout: { text: "ok\n", bytes: 3, inlineTruncated: false },
+    stderr: { text: "", bytes: 0, inlineTruncated: false },
+  } as const;
+  assert.equal(execResultSchema.safeParse(base).success, true);
+  assert.equal(
+    execResultSchema.safeParse({
+      ...base,
+      retentionTruncated: true,
+      retentionDroppedBytes: 4096,
+    }).success,
+    true,
+  );
+  assert.equal(
+    execResultSchema.safeParse({ ...base, retentionTruncated: true }).success,
+    true,
+  );
+  assert.equal(
+    execResultSchema.safeParse({
+      ...base,
+      retentionDroppedBytes: 4096,
+    }).success,
+    false,
+  );
+  assert.equal(
+    execResultSchema.safeParse({
+      ...base,
+      retentionTruncated: "yes",
+    }).success,
+    false,
+  );
+});
+
 test("output chunks use null nextOffset exactly at EOF", () => {
   assert.equal(
     outputChunkSchema.safeParse({

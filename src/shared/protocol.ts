@@ -335,6 +335,12 @@ export const execResultSchema = z
     stderr: outputStreamSummarySchema,
     outputRef: opaqueOutputReferenceSchema.optional(),
     outputExpiresAt: z.iso.datetime({ offset: true }).optional(),
+    // Present only when the gateway stopped persisting output before the
+    // process ended (storage cap or global retention quota). The process kept
+    // running; outputRef holds only the retained prefix. Not related to the
+    // task rolling log's droppedBytes.
+    retentionTruncated: z.boolean().optional(),
+    retentionDroppedBytes: z.number().int().safe().nonnegative().optional(),
   })
   .superRefine((value, context) => {
     if ((value.outputRef === undefined) !== (value.outputExpiresAt === undefined)) {
@@ -352,6 +358,16 @@ export const execResultSchema = z
         code: "custom",
         path: ["outputRef"],
         message: "outputRef is required when an inline output preview is truncated",
+      });
+    }
+    if (
+      value.retentionDroppedBytes !== undefined &&
+      value.retentionTruncated !== true
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["retentionDroppedBytes"],
+        message: "retentionDroppedBytes requires retentionTruncated",
       });
     }
   });

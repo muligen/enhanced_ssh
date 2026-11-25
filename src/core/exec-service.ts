@@ -364,6 +364,16 @@ export class ExecService {
               durationMs: result.durationMs,
               stdoutBytes: result.stdout.bytes,
               stderrBytes: result.stderr.bytes,
+              ...(result.retentionTruncated === true
+                ? {
+                    retentionTruncated: true,
+                    ...(result.retentionDroppedBytes === undefined
+                      ? {}
+                      : {
+                          retentionDroppedBytes: result.retentionDroppedBytes,
+                        }),
+                  }
+                : {}),
               ...(result.outputRef === undefined
                 ? {}
                 : {
@@ -1133,6 +1143,9 @@ export class ExecService {
         termination = active.reason ?? (outcome.aborted ? "cancel" : "exit");
       } catch (error) {
         if (findCause(error, OutputLimitExceededError) !== undefined) {
+          // Only explicit per-call output caps (preset operations) reach this
+          // path. Retention limits no longer terminate; the sink itself stops
+          // persisting and marks the result instead.
           this.#requestStop(active, "output_limit");
           termination = active.reason ?? "output_limit";
         } else if (error instanceof SshExecutionError) {
@@ -1173,6 +1186,7 @@ export class ExecService {
         stderrBytes: output.stderr.bytes,
         truncated:
           termination === "output_limit" ||
+          output.retentionTruncated === true ||
           output.stdout.inlineTruncated ||
           output.stderr.inlineTruncated,
       });
@@ -1189,6 +1203,16 @@ export class ExecService {
           durationMs,
           stdout: output.stdout,
           stderr: output.stderr,
+          ...(output.retentionTruncated === true
+            ? {
+                retentionTruncated: true,
+                ...(output.retentionDroppedBytes === undefined
+                  ? {}
+                  : {
+                      retentionDroppedBytes: output.retentionDroppedBytes,
+                    }),
+              }
+            : {}),
           ...(output.outputRef === undefined
             ? {}
             : {
@@ -1325,7 +1349,12 @@ function toTargetCheckResult(
   failureReason?: TargetCheckFailureReason,
 ): TargetCheckResult {
   const connected = result.termination === "exit" && result.exitCode === 0;
-  const hostname = connected ? extractSafeHostname(result.stdout.text) : undefined;
+  // A retention-truncated probe output can cut the hostname mid-value, so it
+  // is withheld rather than reporting a prefix as a trusted hostname.
+  const hostname =
+    connected && result.retentionTruncated !== true
+      ? extractSafeHostname(result.stdout.text)
+      : undefined;
   return {
     target,
     connected,

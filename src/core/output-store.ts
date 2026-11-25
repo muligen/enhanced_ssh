@@ -43,6 +43,19 @@ export interface StoredOutputSummary {
   readonly stderr: OutputStreamSummary;
   readonly outputRef?: string;
   readonly outputExpiresAt?: string;
+  /**
+   * True when disk retention stopped before the process output ended because
+   * the per-execution storage cap or the global retention quota was reached.
+   * The process was not terminated; `outputRef` (when present) holds only the
+   * retained prefix.
+   */
+  readonly retentionTruncated?: boolean;
+  /**
+   * Bytes observed after retention stopped that were not written to disk.
+   * This is distinct from the task rolling log's `droppedBytes`, which counts
+   * bytes evicted from the bounded in-memory `ssh_tail` buffer.
+   */
+  readonly retentionDroppedBytes?: number;
 }
 
 export interface OutputSink {
@@ -872,7 +885,8 @@ class FileOutputSink implements OutputSink {
   };
   #tail: Promise<void> = Promise.resolve();
   #accepting = true;
-  #limitError: OutputLimitExceededError | undefined;
+  #retentionTruncated = false;
+  #retentionDroppedBytes = 0;
   #fatalError: OutputStoreIoError | undefined;
   #finalizePromise: Promise<StoredOutputSummary> | undefined;
   #abortPromise: Promise<void> | undefined;
@@ -1006,17 +1020,23 @@ class FileOutputSink implements OutputSink {
     if (this.#fatalError !== undefined) {
       throw this.#fatalError;
     }
-    if (this.#limitError !== undefined) {
-      throw this.#limitError;
-    }
     if (chunk.byteLength === 0) {
+      return;
+    }
+    if (this.#retentionTruncated) {
+      // Truncation is monotonic: once retention stopped, later chunks stay
+      // dropped even if the global quota frees up mid-execution, so the
+      // retained output stays a contiguous prefix.
+      this.#retentionDroppedBytes += chunk.byteLength;
       return;
     }
 
     const totalBytesBeforeAppend =
       this.#streams.stdout.totalBytes + this.#streams.stderr.totalBytes;
-    const perExecutionRemaining =
-      this.#maxStoredBytes - totalBytesBeforeAppend;
+    const perExecutionRemaining = Math.max(
+      0,
+      this.#maxStoredBytes - totalBytesBeforeAppend,
+    );
     const requestedBytes = Math.min(
       perExecutionRemaining,
       chunk.byteLength,
@@ -1060,26 +1080,12 @@ class FileOutputSink implements OutputSink {
     }
 
     if (storedChunk.byteLength !== chunk.byteLength) {
-      this.#limitError =
-        reservation.entryLimit !== undefined
-          ? new OutputLimitExceededError(
-              reservation.entryLimit.maxEntries,
-              reservation.entryLimit.currentEntries,
-              1,
-              "entries",
-            )
-          : reservation.grantedBytes < requestedBytes
-          ? new OutputLimitExceededError(
-              reservation.maxBytes,
-              reservation.currentBytes,
-              chunk.byteLength,
-            )
-          : new OutputLimitExceededError(
-              this.#maxStoredBytes,
-              totalBytesBeforeAppend,
-              chunk.byteLength,
-            );
-      throw this.#limitError;
+      // Retention limits are backpressure, not a termination condition: the
+      // sink stops persisting and reports the truncated prefix, while the
+      // process keeps running. Disk usage stays bounded because only the
+      // granted prefix was ever written.
+      this.#retentionTruncated = true;
+      this.#retentionDroppedBytes += chunk.byteLength - storedChunk.byteLength;
     }
   }
 
@@ -1101,6 +1107,15 @@ class FileOutputSink implements OutputSink {
       this.#streams.stderr,
       this.#inlineBytesPerStream,
     );
+    const retentionFields: {
+      readonly retentionTruncated?: true;
+      readonly retentionDroppedBytes?: number;
+    } = this.#retentionTruncated
+      ? {
+          retentionTruncated: true,
+          retentionDroppedBytes: this.#retentionDroppedBytes,
+        }
+      : {};
     if (!stdout.inlineTruncated && !stderr.inlineTruncated) {
       try {
         await rm(this.#directory, { recursive: true, force: true });
@@ -1108,7 +1123,7 @@ class FileOutputSink implements OutputSink {
       } catch (error) {
         throw new OutputStoreIoError({ cause: error });
       }
-      return { stdout, stderr };
+      return { stdout, stderr, ...retentionFields };
     }
 
     const expiresAtMs = Math.trunc(this.#now() + this.#ttlMs);
@@ -1147,6 +1162,7 @@ class FileOutputSink implements OutputSink {
     return {
       stdout,
       stderr,
+      ...retentionFields,
       outputRef: this.#reference,
       outputExpiresAt: new Date(expiresAtMs).toISOString(),
     };

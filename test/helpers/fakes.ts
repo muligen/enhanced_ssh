@@ -4,11 +4,10 @@ import type {
   SshOutcome,
   SshRunInput,
 } from "../../src/infra/openssh-executor.js";
-import {
-  OutputLimitExceededError,
-  type OutputSink,
-  type OutputStore,
-  type StoredOutputSummary,
+import type {
+  OutputSink,
+  OutputStore,
+  StoredOutputSummary,
 } from "../../src/core/output-store.js";
 import { ExecService } from "../../src/core/exec-service.js";
 import { TargetRegistry } from "../../src/core/target-registry.js";
@@ -97,6 +96,8 @@ class MemoryOutputSink implements OutputSink {
     stdout: [],
     stderr: [],
   };
+  #droppedBytes = 0;
+  #truncated = false;
   #closed = false;
 
   public constructor(
@@ -109,12 +110,21 @@ class MemoryOutputSink implements OutputSink {
     this.#maxStoredBytes = maxStoredBytes;
   }
 
+  /** Mirrors the real sink: retention limits stop persisting without throwing. */
+  public get retentionDroppedBytes(): number {
+    return this.#droppedBytes;
+  }
+
   public async append(
     stream: OutputStream,
     chunk: Uint8Array,
   ): Promise<void> {
     if (this.#closed) {
       throw new Error("Memory output sink is closed");
+    }
+    if (this.#truncated) {
+      this.#droppedBytes += chunk.byteLength;
+      return;
     }
     const copied = Buffer.from(chunk);
     const currentBytes = this.#totalBytes();
@@ -124,11 +134,8 @@ class MemoryOutputSink implements OutputSink {
       this.#chunks[stream].push(Buffer.from(stored));
     }
     if (stored.length !== copied.length) {
-      throw new OutputLimitExceededError(
-        this.#maxStoredBytes,
-        currentBytes,
-        copied.length,
-      );
+      this.#truncated = true;
+      this.#droppedBytes += copied.length - stored.length;
     }
   }
 
@@ -136,12 +143,19 @@ class MemoryOutputSink implements OutputSink {
     this.#closed = true;
     const stdout = this.#summary("stdout");
     const stderr = this.#summary("stderr");
+    const retentionFields: {
+      readonly retentionTruncated?: true;
+      readonly retentionDroppedBytes?: number;
+    } = this.#droppedBytes > 0
+      ? { retentionTruncated: true, retentionDroppedBytes: this.#droppedBytes }
+      : {};
     if (!stdout.inlineTruncated && !stderr.inlineTruncated) {
-      return { stdout, stderr };
+      return { stdout, stderr, ...retentionFields };
     }
     return {
       stdout,
       stderr,
+      ...retentionFields,
       outputRef: this.reference,
       outputExpiresAt: "2099-01-01T00:00:00.000Z",
     };

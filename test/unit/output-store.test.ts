@@ -13,7 +13,6 @@ import test from "node:test";
 
 import {
   OutputExpiredError,
-  OutputLimitExceededError,
   OutputNotFoundError,
   OutputStore,
   OutputStoreIoError,
@@ -229,7 +228,7 @@ test("removes the spool when both streams fit inline", async (t) => {
   assert.deepEqual(await readdir(directory), []);
 });
 
-test("throws a typed error before exceeding the aggregate hard limit", async (t) => {
+test("stops persisting and marks truncation at the aggregate hard limit", async (t) => {
   const directory = await temporaryDirectory();
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = await OutputStore.open({
@@ -242,21 +241,16 @@ test("throws a typed error before exceeding the aggregate hard limit", async (t)
   });
   const sink = await store.create("limit-request");
   await sink.append("stdout", Buffer.from("abc"));
-
-  await assert.rejects(
-    sink.append("stderr", Buffer.from("def")),
-    (error: unknown) => {
-      assert.ok(error instanceof OutputLimitExceededError);
-      assert.equal(error.maxBytes, 5);
-      assert.equal(error.currentBytes, 3);
-      assert.equal(error.attemptedBytes, 3);
-      return true;
-    },
-  );
+  await sink.append("stderr", Buffer.from("def"));
+  // Later chunks keep resolving and stay uncounted on disk.
+  await sink.append("stdout", Buffer.from("xyz"));
 
   const result = await sink.finalize();
+  assert.equal(result.retentionTruncated, true);
+  assert.equal(result.retentionDroppedBytes, 4);
   assert.equal(result.stdout.bytes, 3);
   assert.equal(result.stderr.bytes, 2);
+  assert.equal(result.stdout.text, "ab");
   assert.equal(result.stderr.text, "de");
   assert.ok(result.outputRef);
   const page = await store.read(result.outputRef, "stdout", 0, 5);
@@ -266,6 +260,65 @@ test("throws a typed error before exceeding the aggregate hard limit", async (t)
     Buffer.from(stderrPage.dataBase64, "base64").toString("utf8"),
     "de",
   );
+});
+
+test("a mid-execution quota release does not resume persisting for a truncated sink", async (t) => {
+  const directory = await temporaryDirectory();
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await OutputStore.open({
+    directory,
+    inlineBytesPerStream: 16,
+    maxStoredBytes: 100,
+    maxTotalRetainedBytes: 10,
+    maxRetainedEntries: 10,
+    ttlMs: 60_000,
+  });
+  const first = await store.create("quota-first");
+  await first.append("stdout", Buffer.from("abcdefgh")); // quota 8/10
+  const second = await store.create("quota-second");
+  await second.append("stdout", Buffer.from("ab")); // granted 2, quota 10/10
+  await second.append("stdout", Buffer.from("XY")); // granted 0, truncated
+  await first.abort(); // frees the global quota mid-execution
+  await second.append("stdout", Buffer.from("ZW")); // must stay dropped
+
+  const result = await second.finalize();
+  assert.deepEqual(result.stdout, {
+    text: "ab",
+    bytes: 2,
+    inlineTruncated: false,
+  });
+  assert.equal(result.retentionTruncated, true);
+  assert.equal(result.retentionDroppedBytes, 4);
+  assert.equal(result.outputRef, undefined);
+  assert.deepEqual(await readdir(directory), []);
+});
+
+test("disk usage stays bounded while chunks keep arriving past the limit", async (t) => {
+  const directory = await temporaryDirectory();
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await OutputStore.open({
+    directory,
+    inlineBytesPerStream: 4,
+    maxStoredBytes: 5,
+    maxTotalRetainedBytes: 100,
+    maxRetainedEntries: 100,
+    ttlMs: 60_000,
+  });
+  const sink = await store.create("bounded-disk");
+  await sink.append("stdout", Buffer.from("aaa"));
+  for (let index = 0; index < 8; index += 1) {
+    await sink.append("stdout", Buffer.from("0123456789"));
+  }
+
+  const result = await sink.finalize();
+  assert.equal(result.stdout.bytes, 5);
+  assert.equal(result.retentionTruncated, true);
+  assert.equal(result.retentionDroppedBytes, 78);
+  const entryDirectory = (await readdir(directory))[0]!;
+  const payloadStat = await readFile(
+    join(directory, entryDirectory, "stdout.bin"),
+  );
+  assert.equal(payloadStat.byteLength, 5);
 });
 
 test("rejects forged and expired references without exposing storage paths", async (t) => {
@@ -365,7 +418,7 @@ test("cleanup skips output entries that are still being written", async (t) => {
   assert.equal(result.stdout.text, "in progress");
 });
 
-test("enforces the total retained byte quota atomically across concurrent sinks", async (t) => {
+test("stops persisting at the total retained byte quota across concurrent sinks", async (t) => {
   const directory = await temporaryDirectory();
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = await OutputStore.open({
@@ -384,15 +437,10 @@ test("enforces the total retained byte quota atomically across concurrent sinks"
     second.append("stderr", Buffer.from("bbbb")),
   ]);
 
-  assert.equal(writes[0]!.status, "fulfilled");
-  assert.equal(writes[1]!.status, "rejected");
-  if (writes[1]!.status === "rejected") {
-    const error = writes[1]!.reason as unknown;
-    assert.ok(error instanceof OutputLimitExceededError);
-    assert.equal(error.maxBytes, 5);
-    assert.equal(error.currentBytes, 4);
-    assert.equal(error.attemptedBytes, 4);
-  }
+  assert.equal(
+    writes.every((write) => write.status === "fulfilled"),
+    true,
+  );
 
   const summaries = await Promise.all([first.finalize(), second.finalize()]);
   assert.equal(
@@ -403,23 +451,19 @@ test("enforces the total retained byte quota atomically across concurrent sinks"
     ),
     5,
   );
+  assert.equal(summaries[1]?.retentionTruncated, true);
+  assert.equal(summaries[1]?.retentionDroppedBytes, 3);
   assert.ok(summaries.every((summary) => summary.outputRef !== undefined));
 
   const blocked = await store.create("concurrent-blocked");
-  await assert.rejects(
-    blocked.append("stdout", Buffer.from("x")),
-    (error: unknown) => {
-      assert.ok(error instanceof OutputLimitExceededError);
-      assert.equal(error.maxBytes, 5);
-      assert.equal(error.currentBytes, 5);
-      assert.equal(error.attemptedBytes, 1);
-      return true;
-    },
-  );
-  await blocked.abort();
+  await blocked.append("stdout", Buffer.from("x"));
+  const blockedSummary = await blocked.finalize();
+  assert.equal(blockedSummary.retentionTruncated, true);
+  assert.equal(blockedSummary.retentionDroppedBytes, 1);
+  assert.equal(blockedSummary.outputRef, undefined);
 });
 
-test("enforces the retained entry quota atomically across concurrent sinks", async (t) => {
+test("stops persisting at the retained entry quota across concurrent sinks", async (t) => {
   const directory = await temporaryDirectory();
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = await OutputStore.open({
@@ -438,35 +482,23 @@ test("enforces the retained entry quota atomically across concurrent sinks", asy
     second.append("stderr", Buffer.from("b")),
   ]);
   assert.equal(
-    writes.filter((result) => result.status === "fulfilled").length,
-    1,
+    writes.every((write) => write.status === "fulfilled"),
+    true,
   );
-  const rejectedWrite = writes.find((result) => result.status === "rejected");
-  assert.ok(rejectedWrite);
-  assert.equal(rejectedWrite.status, "rejected");
-  const error = rejectedWrite.reason as unknown;
-  assert.ok(error instanceof OutputLimitExceededError);
-  assert.equal(error.limitKind, "entries");
-  assert.equal(error.maxBytes, 1);
-  assert.equal(error.currentBytes, 1);
-  assert.equal(error.attemptedBytes, 1);
 
   const summaries = await Promise.all([first.finalize(), second.finalize()]);
   assert.equal(
     summaries.filter((summary) => summary.outputRef !== undefined).length,
     1,
   );
+  assert.equal(summaries[1]?.retentionTruncated, true);
+  assert.equal(summaries[1]?.retentionDroppedBytes, 1);
 
   const blocked = await store.create("entry-still-retained");
-  await assert.rejects(
-    blocked.append("stdout", Buffer.from("x")),
-    (blockedError: unknown) => {
-      assert.ok(blockedError instanceof OutputLimitExceededError);
-      assert.equal(blockedError.limitKind, "entries");
-      return true;
-    },
-  );
-  await blocked.abort();
+  await blocked.append("stdout", Buffer.from("x"));
+  const blockedSummary = await blocked.finalize();
+  assert.equal(blockedSummary.retentionTruncated, true);
+  assert.equal(blockedSummary.outputRef, undefined);
 });
 
 test("returns total quota after inline finalize, abort, and storage failure", async (t) => {
@@ -555,15 +587,10 @@ test("retains each entry slot until expired output is removed by read or cleanup
   assert.ok(readExpiredSummary.outputRef);
 
   const blockedBeforeRead = await store.create("blocked-before-read");
-  await assert.rejects(
-    blockedBeforeRead.append("stdout", Buffer.from("x")),
-    (error: unknown) => {
-      assert.ok(error instanceof OutputLimitExceededError);
-      assert.equal(error.limitKind, "entries");
-      return true;
-    },
-  );
-  await blockedBeforeRead.abort();
+  await blockedBeforeRead.append("stdout", Buffer.from("x"));
+  const blockedBeforeReadSummary = await blockedBeforeRead.finalize();
+  assert.equal(blockedBeforeReadSummary.retentionTruncated, true);
+  assert.equal(blockedBeforeReadSummary.outputRef, undefined);
 
   now = 111;
   await assert.rejects(
@@ -577,15 +604,10 @@ test("retains each entry slot until expired output is removed by read or cleanup
   assert.ok(cleanupExpiredSummary.outputRef);
 
   const blockedBeforeCleanup = await store.create("blocked-before-cleanup");
-  await assert.rejects(
-    blockedBeforeCleanup.append("stdout", Buffer.from("x")),
-    (error: unknown) => {
-      assert.ok(error instanceof OutputLimitExceededError);
-      assert.equal(error.limitKind, "entries");
-      return true;
-    },
-  );
-  await blockedBeforeCleanup.abort();
+  await blockedBeforeCleanup.append("stdout", Buffer.from("x"));
+  const blockedBeforeCleanupSummary = await blockedBeforeCleanup.finalize();
+  assert.equal(blockedBeforeCleanupSummary.retentionTruncated, true);
+  assert.equal(blockedBeforeCleanupSummary.outputRef, undefined);
 
   now = 122;
   assert.equal(await store.cleanupExpired(), 1);
@@ -663,16 +685,10 @@ test("restart scans retained bytes and evicts the earliest expiry after a quota 
   );
 
   const blocked = await restarted.create("restart-blocked");
-  await assert.rejects(
-    blocked.append("stdout", Buffer.from("x")),
-    (error: unknown) => {
-      assert.ok(error instanceof OutputLimitExceededError);
-      assert.equal(error.maxBytes, 8);
-      assert.equal(error.currentBytes, 8);
-      return true;
-    },
-  );
-  await blocked.abort();
+  await blocked.append("stdout", Buffer.from("x"));
+  const blockedSummary = await blocked.finalize();
+  assert.equal(blockedSummary.retentionTruncated, true);
+  assert.equal(blockedSummary.retentionDroppedBytes, 1);
 });
 
 test("read releases quota only after confirming the reference directory is absent", async (t) => {
@@ -711,15 +727,10 @@ test("read releases quota only after confirming the reference directory is absen
   );
 
   const blocked = await store.create("blocked-by-incomplete-reference");
-  await assert.rejects(
-    blocked.append("stdout", Buffer.from("c")),
-    (error: unknown) => {
-      assert.ok(error instanceof OutputLimitExceededError);
-      assert.equal(error.limitKind, "entries");
-      return true;
-    },
-  );
-  await blocked.abort();
+  await blocked.append("stdout", Buffer.from("c"));
+  const blockedSummary = await blocked.finalize();
+  assert.equal(blockedSummary.retentionTruncated, true);
+  assert.equal(blockedSummary.outputRef, undefined);
 
   assert.equal(await store.cleanupExpired(), 1);
   const afterCleanup = await store.create("after-incomplete-cleanup");
@@ -795,15 +806,10 @@ test("restart evicts the earliest expiry when the retained entry cap is reduced"
   );
 
   const blocked = await restarted.create("entry-restart-blocked");
-  await assert.rejects(
-    blocked.append("stdout", Buffer.from("d")),
-    (error: unknown) => {
-      assert.ok(error instanceof OutputLimitExceededError);
-      assert.equal(error.limitKind, "entries");
-      return true;
-    },
-  );
-  await blocked.abort();
+  await blocked.append("stdout", Buffer.from("d"));
+  const blockedSummary = await blocked.finalize();
+  assert.equal(blockedSummary.retentionTruncated, true);
+  assert.equal(blockedSummary.outputRef, undefined);
 });
 
 test("startup removes malformed retained entries and unexpected root files", async (t) => {

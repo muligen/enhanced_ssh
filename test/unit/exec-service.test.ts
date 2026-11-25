@@ -594,7 +594,7 @@ test("spawn failures quarantine a permanently blocked output sink", async () => 
   assert.equal(finalizeCalls, 0);
 });
 
-test("returns capped output and an opaque reference when storage is exhausted", async () => {
+test("keeps the process running and marks retention truncation when storage is exhausted", async () => {
   let runInput: SshRunInput | undefined;
   const outputStore = new MemoryOutputStore({
     inlineBytesPerStream: 2,
@@ -613,9 +613,9 @@ test("returns capped output and an opaque reference when storage is exhausted", 
     command: "emit-output",
   });
 
-  assert.equal(runInput?.signal?.aborted, true);
-  assert.equal(result.termination, "output_limit");
-  assert.equal(result.exitCode, null);
+  assert.equal(runInput?.signal?.aborted, false);
+  assert.equal(result.termination, "exit");
+  assert.equal(result.exitCode, 0);
   assert.deepEqual(result.stdout, {
     text: "ab",
     bytes: 4,
@@ -626,13 +626,58 @@ test("returns capped output and an opaque reference when storage is exhausted", 
     bytes: 0,
     inlineTruncated: false,
   });
+  assert.equal(result.retentionTruncated, true);
+  assert.equal(result.retentionDroppedBytes, 2);
   assert.match(result.outputRef ?? "", /^[A-Za-z0-9_-]{43}$/);
   assert.equal(result.outputExpiresAt, "2099-01-01T00:00:00.000Z");
 
   const completed = audit.events.at(-1);
   assert.ok(completed?.event === "exec.completed");
-  assert.equal(completed.termination, "output_limit");
+  assert.equal(completed.termination, "exit");
+  assert.equal(completed.stdoutBytes, 4);
   assert.equal(completed.truncated, true);
+});
+
+test("long tasks keep running and tailing after output retention is capped", async (t) => {
+  const firstPhase = deferred<void>();
+  const release = deferred<void>();
+  const outputStore = new MemoryOutputStore({
+    inlineBytesPerStream: 2,
+    maxStoredBytes: 4,
+  });
+  const executor = new FakeSshExecutor(async (input) => {
+    await input.outputSink?.append("stdout", Buffer.from("abcdef"));
+    firstPhase.resolve();
+    await release.promise;
+    await input.outputSink?.append("stdout", Buffer.from("ghijkl"));
+    return sshOutcome({ exitCode: 0, durationMs: 5 });
+  });
+  const service = testExecService({ executor, outputStore });
+  t.after(async () => {
+    release.resolve();
+    await service.shutdown();
+  });
+
+  const task = service.startTask({ target: "alpha", command: "emit-output" });
+  await firstPhase.promise;
+  const runningTail = service.taskTail(task.runId, undefined, 64);
+  assert.equal(runningTail.state, "running");
+  assert.equal(runningTail.stdout.totalBytes, 6);
+
+  release.resolve();
+  const status = await waitForTerminalTask(service, task.runId);
+  assert.equal(status.state, "succeeded");
+  assert.equal(status.termination, "exit");
+  assert.equal(status.exitCode, 0);
+  assert.equal(status.result?.durationMs, 5);
+  assert.equal(status.result?.stdoutBytes, 4);
+  assert.equal(status.result?.stderrBytes, 0);
+  assert.equal(status.result?.retentionTruncated, true);
+  assert.equal(status.result?.retentionDroppedBytes, 8);
+  assert.equal(typeof status.result?.outputRef, "string");
+  const finalTail = service.taskTail(task.runId, runningTail.nextCursor, 64);
+  assert.equal(finalTail.eof, true);
+  assert.equal(finalTail.stdout.text, "ghijkl");
 });
 
 test("reads retained UTF-8 text with bound cursors and legacy offset alignment", async () => {
@@ -836,7 +881,7 @@ test("connectivity check shares cancellation, concurrency, and reload gates", as
   assert.equal(executor.calls.length, 1);
 });
 
-test("connectivity check enforces output limits without exposing output", async () => {
+test("connectivity check withholds the hostname when retained output was truncated", async () => {
   let runInput: SshRunInput | undefined;
   const outputStore = new MemoryOutputStore({
     inlineBytesPerStream: 2,
@@ -853,14 +898,15 @@ test("connectivity check enforces output limits without exposing output", async 
     target: "alpha",
   });
 
-  assert.equal(runInput?.signal?.aborted, true);
+  assert.equal(runInput?.signal?.aborted, false);
   assert.deepEqual(result, {
     target: "alpha",
-    connected: false,
-    termination: "output_limit",
-    exitCode: null,
+    connected: true,
+    termination: "exit",
+    exitCode: 0,
     durationMs: result.durationMs,
   });
+  assert.equal("hostname" in result, false);
   assert.equal("stdout" in result, false);
   assert.equal("stderr" in result, false);
   assert.equal("outputRef" in result, false);
