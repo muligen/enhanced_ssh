@@ -24,7 +24,17 @@ Phase 1 没有给 Named Pipe 设置自定义内核 DACL，因此部署安全性�
 
 ## 本机管理中心
 
-管理中心是常驻服务的本机管理员控制面，不是远程或多用户运维服务。它只绑定 IPv4 loopback；MCP 不暴露配置修改 API，也不返回私钥内容。真实命令和传输仍由 daemon 独立执行目标映射、平台处理、策略、超时、并发、输出/文件配额和审计检查。OpenSSH 和 AccessClient 的 `full-access` 都跳过命令 allow-list 以及本机/远端传输根目录的范围匹配，并把有效传输方向固定为双向；AccessClient 的传输经该目标的受管 Plink 共享 shell 分块执行。这意味着在 OpenSSH 或 AccessClient 的 full-access 目标上，Agent 都能读到网关本机上 Gateway 运行账户可读的任何文件，包括本机私钥、凭据，以及 Gateway 自己的托管目录和 runtime 文件（例如带管理员 token 的 `runtime\admin.json`）；Full access 的本机路径没有针对这些目录的排除规则。两者都不绕过其他限制，并且每次保存 full-access 目标都要求服务端校验的显式确认。开发者 `--demo` 模式只使用内置模拟结果，不连接 daemon 或 SSH。
+管理中心是常驻服务的本机管理员控制面，不是远程或多用户运维服务。它只绑定 IPv4 loopback；默认情况下 MCP 仅做执行与观测，不暴露配置修改能力，且始终不返回私钥内容或管理中心 token。管理员可在 Web 管理中心「全局设置 → MCP 管理权限」中显式开启持久化开关（保存在托管目录 ACL 加固的 `mcp-admin-policy.json`），或以 `--allow-mcp-admin` 启动 `agent-ssh-service`，从而授权 MCP 通过 `ssh_admin_*` 工具执行机器接入与管理操作。真实命令和传输仍由 daemon 独立执行目标映射、平台处理、策略、超时、并发、输出/文件配额和审计检查。OpenSSH 和 AccessClient 的 `full-access` 都跳过命令 allow-list 以及本机/远端传输根目录的范围匹配，并把有效传输方向固定为双向；AccessClient 的传输经该目标的受管 Plink 共享 shell 分块执行。这意味着在 OpenSSH 或 AccessClient 的 full-access 目标上，Agent 都能读到网关本机上 Gateway 运行账户可读的任何文件，包括本机私钥、凭据，以及 Gateway 自己的托管目录和 runtime 文件（例如带管理员 token 的 `runtime\admin.json`）；Full access 的本机路径没有针对这些目录的排除规则。两者都不绕过其他限制，并且每次保存 full-access 目标都要求服务端校验的显式确认。开发者 `--demo` 模式只使用内置模拟结果，不连接 daemon 或 SSH。
+
+### MCP 管理控制面边界
+
+MCP 进程调用管理中心使用与浏览器 UI token 严格分离的独立 256-bit `mcpAdminToken`（保存在受保护的 `runtime\admin.json` 中，绝不向 MCP 调用方返回）。服务端对携带 `X-Agent-SSH-MCP-Token` 的请求执行独立鉴权与授权：
+
+- 拒绝携带任何浏览器头（`Origin`、`Sec-Fetch-Site`、`Cookie`、`X-Agent-SSH-UI-Token`）的 MCP 请求，也不向 MCP 签发浏览器 Cookie。
+- 当 MCP 管理开关处于默认关闭状态时，服务端仅允许只读查询开关状态（`/api/admin/mcp-admin/status`，不泄露任何机器、路径、密钥或 revision），并拒绝其余全部管理读写请求（`403 MCP_ADMIN_DISABLED`）。
+- 即使开启 MCP 管理权限，服务端仍永久禁止 MCP 调用 `/api/admin/mcp-admin/save`（MCP 不能自行开启或关闭此开关）和 `/api/admin/key/import`（从本机任意绝对路径导入私钥仅限浏览器管理页面），并禁止 MCP 访问 `/api/run`、`/api/setup/*` 等非管理接口（`403 MCP_ADMIN_FORBIDDEN`）。
+- 通过 MCP 配置 `full-access`、开启受限文件传输、删除机器或删除托管密钥时，客户端与服务端均强制校验显式确认标志（`fullAccessConfirmed`、`transferAccessConfirmed`、`removeConfirmed`），要求 Agent 先向用户确认后再执行。
+- 重要提醒：开启 MCP 管理权限后，能够驱动 MCP 工具的 Agent（包括受提示词注入影响的上下文）在获得确认标志后可修改本机网关配置，包括新增或提权目标。请仅在信任的交互式运维场景下开启，日常无人值守运行建议保持关闭。
 
 管理中心不接受密码、口令、AccessClient URI/票据/原始参数、任意 OpenSSH directive、`ProxyCommand` 或原始 `ProxyJump`。私钥生成和一次性路径导入只在“全局设置”中进行；生成算法限定为 Ed25519 或 RSA 3072。RSA 公钥记录虽然使用 `ssh-rsa` key type，连接仍由 OpenSSH 协商 RSA-SHA2，不会自动开启旧 SHA-1 `ssh-rsa` 签名。OpenSSH 目标和可选堡垒机只能提供结构化 host、port、user 和全局密钥 `keyId`，代理跳转只引用后端生成的固定别名。AccessClient 目标只保存 Plink 路径、物理网关 host/port/user、用于选择 PuTTY pipe 的共享逻辑 host、目标展示端点和预期 hostname。用户名只接受普通安全段，或严格的 `portalUser/targetIPv4/systemUser` 三段透传格式。v3 profile 不接受 `identityFile`，也不保存导入源路径。发布时，服务端按 `keyId` 从受保护的全局密钥库解析 OpenSSH 私钥，并把私钥与 `known_hosts` 复制到 `%LOCALAPPDATA%` 下 ACL 仅允许当前用户与 `SYSTEM` 的 staging revision；AccessClient 目标不生成或复制私钥和 `known_hosts`。
 

@@ -128,13 +128,17 @@ export const MANAGED_SUPPORTED_COMMANDS = [
   "Get-Culture | Format-List Name, DisplayName",
 ] as const;
 
-const sshHostSchema = z
+export const managedRevisionSchema = z
+  .string()
+  .regex(REVISION_ID_PATTERN);
+
+export const sshHostSchema = z
   .string()
   .min(1)
   .max(253)
   .refine(isValidSshHost, "must be an IPv4, IPv6, or DNS host name");
 
-const sshUsernameSchema = z
+export const sshUsernameSchema = z
   .string()
   .min(1)
   .max(128)
@@ -143,7 +147,7 @@ const sshUsernameSchema = z
     "must be a simple username or exactly portalUser/targetIPv4/systemUser; username segments may contain only letters, digits, dot, underscore, or hyphen",
   );
 
-const sshPathSchema = z
+export const sshPathSchema = z
   .string()
   .min(1)
   .max(4_096)
@@ -159,14 +163,14 @@ const managedEndpointSchema = z.strictObject({
   identityFile: sshPathSchema,
 });
 
-const managedKeyEndpointSchema = z.strictObject({
+export const managedKeyEndpointSchema = z.strictObject({
   host: sshHostSchema,
   port: z.number().int().min(1).max(65_535),
   username: sshUsernameSchema,
   keyId: managedSshKeyIdSchema.optional(),
 });
 
-const managedAccessClientSessionSchema = z.strictObject({
+export const managedAccessClientSessionSchema = z.strictObject({
   gatewayHost: sshHostSchema,
   gatewayPort: z.number().int().min(1).max(65_535),
   gatewayUsername: sshUsernameSchema,
@@ -216,7 +220,7 @@ const managedCommandSchema = z
     `must not exceed ${MAX_COMMAND_BYTES} UTF-8 bytes`,
   );
 
-const managedAllowedCommandsSchema = z
+export const managedAllowedCommandsSchema = z
   .array(managedCommandSchema)
   .max(MAX_ALLOWED_COMMANDS)
   .refine(
@@ -263,7 +267,7 @@ export const managedSshProfileSchema = z.union([
   legacyManagedSshProfileSchema,
 ]);
 
-const managedDescriptionSchema = z
+export const managedDescriptionSchema = z
   .string()
   .min(1)
   .max(256)
@@ -272,7 +276,7 @@ const managedDescriptionSchema = z
     "must not contain control characters",
   );
 
-const managedRemoteRootSchema = z
+export const managedRemoteRootSchema = z
   .string()
   .min(1)
   .max(4_096)

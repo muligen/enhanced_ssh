@@ -37,6 +37,8 @@ import {
 } from "../shared/protocol.js";
 import { GatewayRpcClient } from "../shared/rpc-client.js";
 import { GATEWAY_VERSION } from "../shared/version.js";
+import { createAdminHttpClient, type AdminClient } from "./admin-client.js";
+import { registerAdminTools } from "./admin.js";
 import { registerGroupTools } from "./groups.js";
 
 export type GatewayRpcClientFactory = () => Promise<GatewayRpcClient>;
@@ -44,6 +46,7 @@ export type GatewayRpcClientFactory = () => Promise<GatewayRpcClient>;
 export interface McpServerOptions {
   readonly dataDirectory?: string;
   readonly openAdmin?: (url: string) => Promise<void>;
+  readonly adminClient?: AdminClient;
 }
 
 const gatewayStatusResultSchema = z.strictObject({
@@ -105,6 +108,10 @@ export function createMcpServer(
     { capabilities: { tools: {} } },
   );
   registerGroupTools(server, clientFactory);
+  registerAdminTools(
+    server,
+    options.adminClient ?? createAdminHttpClient(options.dataDirectory),
+  );
 
   server.registerTool("ssh_list_allowed_operations", {
     description: "Discover the fixed read-only operations permitted by a target's selected permission presets, including parameter schemas and permitted log resources. Empty operations means none are granted by presets; full-access and legacy targets continue to use ssh_exec.",
@@ -126,7 +133,7 @@ export function createMcpServer(
     "ssh_gateway_status",
     {
       description:
-        "Report whether the local SSH management service and Gateway are ready, plus configured target summaries. In each target, maxTimeoutMs is the command limit and maxTransferTimeoutMs is the independent upload/download/sync limit.",
+        "Report whether the local SSH management service and Gateway are ready, plus configured target summaries. In each target, maxTimeoutMs is the command limit and maxTransferTimeoutMs is the independent upload/download/sync limit. Use ssh_admin_get_config to inspect full management settings and whether MCP configuration management is enabled.",
       outputSchema: gatewayStatusResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },

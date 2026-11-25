@@ -17,6 +17,7 @@ const adminDescriptorSchema = z
     origin: z.string().min(1).max(256),
     url: z.string().min(1).max(512),
     startedAt: z.string().datetime({ offset: true }),
+    mcpAdminToken: z.string().regex(UI_TOKEN_PATTERN).optional(),
   })
   .superRefine((descriptor, context) => {
     let origin: URL;
@@ -51,6 +52,16 @@ const adminDescriptorSchema = z
       context.addIssue({
         code: "custom",
         message: "admin URL must be a tokenized IPv4 loopback URL",
+      });
+    }
+    if (
+      descriptor.mcpAdminToken !== undefined &&
+      descriptor.mcpAdminToken === token
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["mcpAdminToken"],
+        message: "mcpAdminToken must be distinct from the browser session token",
       });
     }
   });

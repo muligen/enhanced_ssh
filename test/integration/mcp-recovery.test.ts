@@ -293,6 +293,18 @@ test(
     assert.deepEqual(
       listedTools.map((tool) => tool.name).sort(),
       [
+        "ssh_admin_accessclient_session",
+        "ssh_admin_check_target",
+        "ssh_admin_generate_key",
+        "ssh_admin_get_config",
+        "ssh_admin_launch_ssh_install",
+        "ssh_admin_manage_group",
+        "ssh_admin_remove_key",
+        "ssh_admin_remove_target",
+        "ssh_admin_rename_key",
+        "ssh_admin_save_provider_settings",
+        "ssh_admin_save_target",
+        "ssh_admin_set_target_enabled",
         "ssh_cancel",
         "ssh_check_connection",
         "ssh_docker_preflight",

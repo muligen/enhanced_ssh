@@ -1284,6 +1284,42 @@ test("an armed AccessClient preparation is restored from bootstrap", async () =>
   );
 });
 
+test("MCP admin toggle persists via /api/admin/mcp-admin/save and locks when forced by CLI", async () => {
+  const harness = await startClient({
+    hash: `#token=${SESSION_TOKEN}`,
+    storage: new MemoryStorage(),
+    mcpAdmin: { enabled: false, persistedEnabled: false, source: "settings" },
+  });
+
+  const toggle = requireElement(harness, "mcp-admin-enabled");
+  assert.equal(toggle.checked, false);
+  assert.equal(toggle.disabled, false);
+  assert.equal(requireElement(harness, "mcp-admin-settings-badge").textContent, "已关闭");
+
+  toggle.checked = true;
+  toggle.dispatch("change");
+  await harness.settle();
+
+  const saveRequest = harness.requests.findLast((request) =>
+    request.url.endsWith("/api/admin/mcp-admin/save")
+  );
+  assert.deepEqual(saveRequest?.body, { enabled: true });
+  assert.equal(toggle.checked, true);
+  assert.equal(requireElement(harness, "mcp-admin-settings-badge").textContent, "已开启");
+
+  const cliHarness = await startClient({
+    hash: `#token=${SESSION_TOKEN}`,
+    storage: new MemoryStorage(),
+    mcpAdmin: { enabled: true, persistedEnabled: false, source: "cli" },
+  });
+  assert.equal(requireElement(cliHarness, "mcp-admin-enabled").checked, true);
+  assert.equal(requireElement(cliHarness, "mcp-admin-enabled").disabled, true);
+  assert.equal(
+    requireElement(cliHarness, "mcp-admin-settings-badge").textContent,
+    "已开启（启动参数）",
+  );
+});
+
 async function startClient(options: {
   readonly hash: string;
   readonly storage: MemoryStorage;
@@ -1294,6 +1330,7 @@ async function startClient(options: {
   readonly customGroups?: readonly string[];
   readonly unconfigured?: boolean;
   readonly targetPatch?: Readonly<Record<string, unknown>>;
+  readonly mcpAdmin?: Readonly<{ enabled: boolean; persistedEnabled: boolean; source: "settings" | "cli" }>;
 }): Promise<ClientHarness> {
   const source = await readFile(APP_SCRIPT, "utf8");
   const elements = new Map<string, FakeElement>();
@@ -1352,6 +1389,11 @@ async function startClient(options: {
   }
   if (options.customGroups) currentProfile = { ...(currentProfile as object), groups: [...options.customGroups] };
   if (options.unconfigured) currentProfile = { version: 3, targets: {} };
+  let mcpAdminState = options.mcpAdmin ?? {
+    enabled: false,
+    persistedEnabled: false,
+    source: "settings" as const,
+  };
   let accessClientPreparation: Record<string, unknown> = networkMode === "prepare-active"
     ? {
         state: "armed",
@@ -1424,7 +1466,18 @@ async function startClient(options: {
         ...status,
         ...(options.unconfigured ? { revision: undefined } : {}),
         accessClientSession: accessClientPreparation,
+        mcpAdmin: mcpAdminState,
       });
+    }
+    if (_url.endsWith("/api/admin/mcp-admin/save")) {
+      if (mcpAdminState.source === "cli") {
+        return response(409, {
+          error: { code: "MCP_ADMIN_CLI_OVERRIDE", message: "Forced by CLI" },
+        });
+      }
+      const desired = (body as { readonly enabled?: unknown })?.enabled === true;
+      mcpAdminState = { enabled: desired, persistedEnabled: desired, source: "settings" };
+      return response(200, { mcpAdmin: mcpAdminState });
     }
     if (_url.endsWith("/api/admin/key/generate")) {
       const label = typeof (body as { readonly label?: unknown })?.label === "string"

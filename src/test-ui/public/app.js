@@ -255,6 +255,13 @@ const elements = {
   tailscaleSettingsDetail: document.querySelector("#tailscale-settings-detail"),
   tailscaleSettingsError: document.querySelector("#tailscale-settings-error"),
   tailscaleSettingsStatus: document.querySelector("#tailscale-settings-status"),
+  mcpAdminEnabled: document.querySelector("#mcp-admin-enabled"),
+  mcpAdminSettingsBadge: document.querySelector("#mcp-admin-settings-badge"),
+  mcpAdminSettingsDot: document.querySelector("#mcp-admin-settings-dot"),
+  mcpAdminSettingsLabel: document.querySelector("#mcp-admin-settings-label"),
+  mcpAdminSettingsDetail: document.querySelector("#mcp-admin-settings-detail"),
+  mcpAdminSettingsError: document.querySelector("#mcp-admin-settings-error"),
+  mcpAdminSettingsStatus: document.querySelector("#mcp-admin-settings-status"),
   commandTargetName: document.querySelector("#command-target-name"),
   commandPolicyBadge: document.querySelector("#command-policy-badge"),
   operationTabs: [...document.querySelectorAll(".operation-tab")],
@@ -371,6 +378,8 @@ const state = {
   tailscaleSettingsBaseline: "",
   tailscaleSettingsDirty: false,
   tailscaleMutationBusy: false,
+  mcpAdminSettings: { enabled: false, persistedEnabled: false, source: "settings" },
+  mcpAdminMutationBusy: false,
   accessClientSettings: { plinkExecutable: "" },
   accessClientSettingsBaseline: "",
   accessClientSettingsDirty: false,
@@ -473,7 +482,7 @@ async function refreshApplication(options = {}) {
     state.refreshing ||
     state.mutationBusy ||
     state.keyMutationBusy ||
-    state.tailscaleMutationBusy || state.accessClientMutationBusy ||
+    state.tailscaleMutationBusy || state.accessClientMutationBusy || state.mcpAdminMutationBusy ||
     state.running
   ) {
     return;
@@ -488,6 +497,7 @@ async function refreshApplication(options = {}) {
   clearAlert(elements.keyError);
   clearAlert(elements.tailscaleSettingsError);
   clearAlert(elements.accessClientSettingsError);
+  clearAlert(elements.mcpAdminSettingsError);
   state.keyLoadError = null;
   setGatewayState("checking", "正在读取配置", "本机管理服务");
   const preferredAlias = options.preferredAlias ?? state.selectedAlias;
@@ -576,6 +586,7 @@ function applyFleetStatus(rawStatus, options = {}) {
   }
   applyAccessClientSettingsSnapshot(status, options.preserveAccessClientDraft === true);
   applyTailscaleSettingsSnapshot(status, options.preserveAccessClientDraft === true);
+  applyMcpAdminSettingsSnapshot(status);
   if (!applyKeySnapshot(status)) {
     showAlert(
       elements.keyError,
@@ -642,6 +653,19 @@ function applyTailscaleSettingsSnapshot(rawStatus, preserveDraft = false) {
   elements.tailscaleExecutable.value = preserveDraft && wasDirty ? draft : executable;
   state.tailscaleSettingsDirty = elements.tailscaleExecutable.value.trim() !== executable;
   renderTailscaleSettings();
+}
+
+function applyMcpAdminSettingsSnapshot(rawStatus) {
+  const status = rawStatus?.status && typeof rawStatus.status === "object" ? rawStatus.status : rawStatus;
+  const raw = status?.mcpAdmin;
+  if (raw && typeof raw === "object") {
+    state.mcpAdminSettings = {
+      enabled: raw.enabled === true,
+      persistedEnabled: raw.persistedEnabled === true,
+      source: raw.source === "cli" ? "cli" : "settings",
+    };
+  }
+  renderMcpAdminSettings();
 }
 
 function normaliseFleetTarget(value) {
@@ -2477,6 +2501,73 @@ async function saveTailscaleSettings(event) {
   }
 }
 
+function renderMcpAdminSettings() {
+  const { enabled, persistedEnabled, source } = state.mcpAdminSettings;
+  const forcedByCli = source === "cli";
+  elements.mcpAdminEnabled.checked = enabled;
+  elements.mcpAdminSettingsBadge.textContent = forcedByCli
+    ? "已开启（启动参数）"
+    : enabled
+      ? "已开启"
+      : "已关闭";
+  elements.mcpAdminSettingsBadge.className = `state-badge ${enabled ? "is-enabled" : "is-draft"}`;
+  elements.mcpAdminSettingsDot.className = `status-dot ${enabled ? "is-online" : "is-idle"}`;
+  elements.mcpAdminSettingsLabel.textContent = forcedByCli
+    ? "已通过 --allow-mcp-admin 启动参数开启"
+    : enabled
+      ? "已允许 MCP 管理机器与配置"
+      : "已关闭（默认）";
+  elements.mcpAdminSettingsDetail.textContent = forcedByCli
+    ? `当前进程由 --allow-mcp-admin 强制开启；移除该参数重启后将恢复为持久化设置（${persistedEnabled ? "已开启" : "已关闭"}）。`
+    : enabled
+      ? "AI Agent 可通过 MCP 接入机器、管理分组与生成密钥；完全访问、文件传输与删除机器/密钥仍需用户确认，私钥正文与导入路径不向 MCP 开放。"
+      : "关闭时 MCP 仅执行和观测，拒绝配置修改。开启后生效无需重启；MCP 绝不能自行修改此开关。";
+}
+
+async function saveMcpAdminSettings() {
+  if (
+    state.mcpAdminMutationBusy ||
+    state.refreshing ||
+    state.mutationBusy ||
+    state.keyMutationBusy ||
+    state.tailscaleMutationBusy ||
+    state.accessClientMutationBusy ||
+    state.checking ||
+    state.inspecting ||
+    state.running ||
+    !state.inventoryAvailable ||
+    state.mcpAdminSettings.source === "cli"
+  ) {
+    elements.mcpAdminEnabled.checked = state.mcpAdminSettings.enabled;
+    return;
+  }
+  const desired = Boolean(elements.mcpAdminEnabled.checked);
+  if (desired === state.mcpAdminSettings.enabled) {
+    return;
+  }
+  state.mcpAdminMutationBusy = true;
+  clearAlert(elements.mcpAdminSettingsError);
+  showAlert(elements.mcpAdminSettingsStatus, desired ? "正在开启 MCP 管理权限..." : "正在关闭 MCP 管理权限...", "progress");
+  updateControls();
+  try {
+    const result = await postApi("admin/mcp-admin/save", { enabled: desired });
+    applyMcpAdminSettingsSnapshot(result);
+    showAlert(
+      elements.mcpAdminSettingsStatus,
+      desired ? "已开启 MCP 管理权限，无需重启服务。" : "已关闭 MCP 管理权限。",
+      "success",
+    );
+    showToast(desired ? "已开启 MCP 管理权限" : "已关闭 MCP 管理权限");
+  } catch (error) {
+    elements.mcpAdminEnabled.checked = state.mcpAdminSettings.enabled;
+    clearAlert(elements.mcpAdminSettingsStatus);
+    showAlert(elements.mcpAdminSettingsError, messageForError(error), "error");
+  } finally {
+    state.mcpAdminMutationBusy = false;
+    updateControls();
+  }
+}
+
 function renderKeyManagement() {
   elements.keyCount.textContent = state.keysLoaded ? String(state.keys.size) : "--";
   elements.keyList.replaceChildren();
@@ -3912,7 +4003,7 @@ async function copyWithFeedback(text, button, toastText) {
 }
 
 function updateControls() {
-  const blocked = state.refreshing || state.mutationBusy || state.keyMutationBusy || state.tailscaleMutationBusy || state.accessClientMutationBusy || state.accessClientPreparationBusy || state.checking || state.inspecting;
+  const blocked = state.refreshing || state.mutationBusy || state.keyMutationBusy || state.tailscaleMutationBusy || state.accessClientMutationBusy || state.mcpAdminMutationBusy || state.accessClientPreparationBusy || state.checking || state.inspecting;
   const inventoryBlocked = !state.inventoryAvailable;
   const selectedTarget = state.selectedAlias ? state.targets.get(state.selectedAlias) : null;
   const accessClientDraft = selectedRadio(elements.connectionModeInputs) === "accessclient-share";
@@ -4034,6 +4125,7 @@ function updateControls() {
   elements.saveAccessClientSettingsButton.textContent = state.accessClientMutationBusy
     ? "正在保存..."
     : "保存";
+  elements.mcpAdminEnabled.disabled = blocked || state.running || inventoryBlocked || state.mcpAdminSettings.source === "cli";
 
   for (const control of elements.transferForm.querySelectorAll("input, textarea, select, button")) {
     control.disabled = operationBlocked;
@@ -4195,6 +4287,10 @@ function messageForError(error) {
     PLINK_NOT_FOUND: "找不到 Plink 程序，请在全局设置中检查 plink.exe 路径。",
     PLINK_INVALID: "Plink 程序无法启动，请确认路径指向可执行的 plink.exe。",
     SSH_HOST_KEY_MISMATCH: "主机指纹与 known_hosts 不一致，连接已拒绝。",
+    MCP_ADMIN_CLI_OVERRIDE: "当前服务通过 --allow-mcp-admin 启动参数强制开启 MCP 管理权限，请移除该参数重启后再修改。",
+    MCP_ADMIN_DISABLED: "MCP 管理权限当前已关闭，请在全局设置中开启。",
+    MCP_ADMIN_FORBIDDEN: "此管理操作仅限在本机 Web 管理中心中执行。",
+    CONFIRMATION_REQUIRED: "该高危操作需要显式确认后才能执行。",
     INTERNAL_ERROR: "网关内部错误，请查看服务输出或重启 SSH 网关后重试。",
   };
   if (messages[error.code]) return messages[error.code];
@@ -4257,6 +4353,7 @@ elements.tailscaleSettingsForm.addEventListener("input", handleTailscaleSettings
 elements.tailscaleSettingsForm.addEventListener("submit", saveTailscaleSettings);
 elements.accessClientSettingsForm.addEventListener("input", handleAccessClientSettingsInput);
 elements.accessClientSettingsForm.addEventListener("submit", saveAccessClientSettings);
+elements.mcpAdminEnabled.addEventListener("change", () => void saveMcpAdminSettings());
 elements.targetManageKeysButton.addEventListener("click", () => setActiveView("settings"));
 elements.prepareAccessClientButton.addEventListener("click", prepareAccessClientSession);
 elements.cancelAccessClientPrepareButton.addEventListener("click", cancelAccessClientPreparation);
