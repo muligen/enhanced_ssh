@@ -607,20 +607,49 @@ export const downloadParamsSchema = z.strictObject({
 });
 export type DownloadParams = z.infer<typeof downloadParamsSchema>;
 
-export const syncParamsSchema = z.strictObject({
-  ...transferCommonFields,
-  exclude: z
-    .array(
-      z
-        .string()
-        .min(1)
-        .max(512)
-        .refine((value) => !/[\0\r\n]/u.test(value)),
-    )
-    .max(MAX_TRANSFER_EXCLUDES)
-    .default([]),
-  verifyExisting: z.boolean().default(false),
-});
+export const syncOnExistingSchema = z.enum(["skip-identical", "overwrite", "fail"]);
+export type SyncOnExisting = z.infer<typeof syncOnExistingSchema>;
+export const syncLinksSchema = z.enum(["skip", "fail"]);
+export type SyncLinks = z.infer<typeof syncLinksSchema>;
+
+export const syncParamsSchema = z
+  .strictObject({
+    ...transferCommonFields,
+    exclude: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(512)
+          .refine((value) => !/[\0\r\n]/u.test(value)),
+      )
+      .max(MAX_TRANSFER_EXCLUDES)
+      .default([]),
+    // Legacy switches. Without onExisting: overwrite=true maps to the
+    // "overwrite" mode. verifyExisting is accepted as a legacy no-op:
+    // "skip-identical" and "overwrite" compare size and SHA-256 first and
+    // skip identical files, while "fail" fails on any existing remote file.
+    verifyExisting: z.boolean().default(false),
+    // Default "skip-identical" makes repeated syncs idempotent: identical
+    // remote files are skipped, differing ones are reported as conflicts in
+    // the task log instead of failing the task.
+    onExisting: syncOnExistingSchema.optional(),
+    links: syncLinksSchema.default("skip"),
+  })
+  .superRefine((value, context) => {
+    if (
+      value.overwrite === true &&
+      value.onExisting !== undefined &&
+      value.onExisting !== "overwrite"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["onExisting"],
+        message:
+          'onExisting "skip-identical" and "fail" conflict with overwrite: true; omit overwrite or use onExisting "overwrite"',
+      });
+    }
+  });
 export type SyncParams = z.infer<typeof syncParamsSchema>;
 
 export const targetInspectParamsSchema = targetCheckParamsSchema;

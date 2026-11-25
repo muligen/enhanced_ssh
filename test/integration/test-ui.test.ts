@@ -740,6 +740,7 @@ test("forwards daemon task lifecycle and transfer defaults", async (t) => {
     dryRun: false,
     exclude: [],
     verifyExisting: false,
+    links: "skip",
   });
 });
 
