@@ -33,6 +33,8 @@ import {
 import { GATEWAY_ERROR_CODES, GatewayError } from "../shared/errors.js";
 import type {
   DownloadParams,
+  SyncLinks,
+  SyncOnExisting,
   SyncParams,
   TaskStartResult,
   UploadParams,
@@ -96,6 +98,11 @@ interface EnumerationLimits {
   readonly maxFiles: number;
   readonly maxFileBytes: number;
   readonly maxTotalBytes: number;
+}
+
+interface EnumerationLinkPolicy {
+  readonly links: SyncLinks;
+  readonly onSkippedLink?: (relativePath: string) => void;
 }
 
 interface ExcludeMatcher {
@@ -688,6 +695,7 @@ export class TransferService {
       "directory",
     ).catch(rethrowTransferPath);
     const excludeMatchers = compileExcludePatterns(params.exclude);
+    let skippedLinks = 0;
     const { files, totalBytes } = await enumerateFiles(
       source.absolutePath,
       excludeMatchers,
@@ -697,6 +705,16 @@ export class TransferService {
         maxTotalBytes: prepared.authorization.maxTotalBytes,
       },
       context.signal,
+      {
+        links: params.links,
+        onSkippedLink: (relativePath) => {
+          skippedLinks += 1;
+          context.append(
+            "stdout",
+            `Skipped link: ${formatSyncEntryPath(relativePath)}\n`,
+          );
+        },
+      },
     );
     if (params.dryRun) {
       context.append("stdout", "Dry run complete; no remote data was changed.\n");
@@ -707,12 +725,16 @@ export class TransferService {
           bytes: totalBytes,
           uploaded: 0,
           skipped: 0,
+          conflicts: 0,
+          skippedLinks,
         },
       };
     }
 
+    const onExisting = resolveSyncOnExisting(params);
     let uploaded = 0;
     let skipped = 0;
+    let conflicts = 0;
     let stagedBytes = 0;
     for (const [index, file] of files.entries()) {
       context.signal.throwIfAborted();
@@ -735,19 +757,34 @@ export class TransferService {
           throw transferFailure("Directory sync exceeds the configured transfer quota");
         }
         stagedBytes += staged.size;
-        if (params.verifyExisting) {
-          const existingFingerprint = await readRemoteFingerprint(
-            prepared.generation.ssh,
-            prepared.authorization,
-            remotePath,
-            context.signal,
-          );
+        const existingFingerprint = await readRemoteFingerprint(
+          prepared.generation.ssh,
+          prepared.authorization,
+          remotePath,
+          context.signal,
+        );
+        if (existingFingerprint !== undefined) {
+          if (onExisting === "fail") {
+            throw transferFailure(
+              `Remote file already exists: ${formatSyncEntryPath(file.relativePath)}`,
+            );
+          }
           if (
-            existingFingerprint !== undefined &&
-            existingFingerprint.size === staged.size &&
-            existingFingerprint.sha256 === staged.sha256
+            fingerprintsMatch(existingFingerprint, {
+              size: staged.size,
+              sha256: staged.sha256,
+            })
           ) {
+            // Identical remote content: both non-fail modes skip the upload.
             skipped += 1;
+            continue;
+          }
+          if (onExisting === "skip-identical") {
+            conflicts += 1;
+            context.append(
+              "stdout",
+              `Sync conflict (kept remote file): ${formatSyncEntryPath(file.relativePath)}\n`,
+            );
             continue;
           }
         }
@@ -758,7 +795,9 @@ export class TransferService {
           remotePath,
           staged.size,
           staged.sha256,
-          params.overwrite,
+          // Only a differing existing file is replaced; a missing destination
+          // still publishes exclusively.
+          existingFingerprint !== undefined,
           params.resume,
         );
         uploaded += 1;
@@ -766,7 +805,10 @@ export class TransferService {
         await unlink(staged.path).catch(() => undefined);
       }
     }
-    context.append("stdout", "Directory sync completed.\n");
+    context.append(
+      "stdout",
+      `Directory sync completed: ${uploaded} uploaded, ${skipped} skipped, ${conflicts} conflicts, ${skippedLinks} links skipped.\n`,
+    );
     return {
       result: {
         dryRun: false,
@@ -774,6 +816,8 @@ export class TransferService {
         bytes: totalBytes,
         uploaded,
         skipped,
+        conflicts,
+        skippedLinks,
       },
     };
   }
@@ -1920,6 +1964,7 @@ async function enumerateFiles(
   excludes: readonly ExcludeMatcher[],
   limits: EnumerationLimits,
   signal: AbortSignal,
+  linkPolicy: EnumerationLinkPolicy,
 ): Promise<{ readonly files: SyncFile[]; readonly totalBytes: number }> {
   requireEnumerationLimit(limits.maxFiles, "maxFiles");
   requireEnumerationLimit(limits.maxFileBytes, "maxFileBytes");
@@ -1949,7 +1994,15 @@ async function enumerateFiles(
         const stats = await lstat(absolutePath);
         signal.throwIfAborted();
         if (stats.isSymbolicLink()) {
-          throw transferFailure("Directory sync does not follow links or reparse points");
+          // Links are never followed; the remote link and ancestor checks are
+          // unaffected by this local enumeration policy.
+          if (linkPolicy.links === "fail") {
+            throw transferFailure(
+              `Directory sync encountered a symbolic link or reparse point: ${formatSyncEntryPath(relativePath)}`,
+            );
+          }
+          linkPolicy.onSkippedLink?.(relativePath);
+          continue;
         }
         if (stats.isDirectory()) {
           await visit(absolutePath, relativePath);
@@ -1978,6 +2031,20 @@ async function enumerateFiles(
   await visit(root, "");
   signal.throwIfAborted();
   return { files, totalBytes };
+}
+
+/**
+ * Legacy `overwrite`/`verifyExisting` mapping when `onExisting` is omitted:
+ * `overwrite: true` keeps the destructive replace mode, everything else uses
+ * the new idempotent default. Explicit `onExisting` always wins; combining it
+ * with `overwrite: true` is rejected by the schema unless the mode is
+ * "overwrite".
+ */
+function resolveSyncOnExisting(params: SyncParams): SyncOnExisting {
+  if (params.onExisting !== undefined) {
+    return params.onExisting;
+  }
+  return params.overwrite ? "overwrite" : "skip-identical";
 }
 
 type GlobToken =
@@ -2161,9 +2228,38 @@ function unsafeRemotePathError(): GatewayError {
 }
 
 function transferFailure(message: string, cause?: unknown): GatewayError {
-  return new GatewayError(GATEWAY_ERROR_CODES.transferFailed, message, {
-    ...(cause === undefined ? {} : { cause }),
-  });
+  // Task completion errors surface verbatim in ssh_status, whose schema
+  // bounds error.message at 256 bytes; keep every failure inside that bound.
+  return new GatewayError(
+    GATEWAY_ERROR_CODES.transferFailed,
+    boundedTaskStatusText(message),
+    {
+      ...(cause === undefined ? {} : { cause }),
+    },
+  );
+}
+
+/** Escapes control characters so entry paths cannot forge log lines. */
+function formatSyncEntryPath(relativePath: string): string {
+  return relativePath.replaceAll(
+    /[\u0000-\u001f\u007f]/gu,
+    (character) =>
+      `\\u${character.codePointAt(0)!.toString(16).padStart(4, "0")}`,
+  );
+}
+
+function boundedTaskStatusText(message: string): string {
+  if (Buffer.byteLength(message, "utf8") <= 256) {
+    return message;
+  }
+  let truncated = message;
+  while (
+    truncated.length > 0 &&
+    Buffer.byteLength(`${truncated}...`, "utf8") > 256
+  ) {
+    truncated = truncated.slice(0, -1);
+  }
+  return `${truncated}...`;
 }
 
 function publicTransferPathError(error: unknown): GatewayError {

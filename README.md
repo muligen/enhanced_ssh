@@ -297,6 +297,8 @@ Full access 目标还支持结构化执行。Windows 可选 `powershell` 或 `cm
 
 `shell` 不能指定任意可执行文件，`encoding` 当前固定为 `utf-8`。脚本、工作目录和环境变量通过受管 stdin 传给固定远端入口，但仍属于远端可执行输入，不要在其中放置密码、私钥或长期 token。
 
+`ssh_exec` 未传 `timeoutMs` 时默认使用 60 秒（仍受目标 `maxTimeoutMs` 约束）；显式传入时按传入值执行。执行因超时或取消结束时，结果仍返回已收到的 `stdout`/`stderr` 和 `outputRef`，便于诊断。保留输出受单次上限（托管配置 10 MiB）和全局配额约束：达到上限时 Gateway 停止继续落盘保留，进程继续运行，结果以 `retentionTruncated: true` 和 `retentionDroppedBytes` 标注，此时 `outputRef` 只包含已保留的前缀。
+
 ### 跟踪长任务
 
 构建、安装和其他耗时工作应使用 `ssh_start`：
@@ -310,6 +312,8 @@ ssh_cancel({ "runId": "..." }) -> 取消仍在运行的任务
 ```
 
 任务在发起它的 MCP 连接断开后仍会继续，新的 MCP 连接可凭同一 `runId` 查询或取消。任务只保留到配置的 TTL，且不跨 daemon 重启持久化。不要在启动响应不确定时自动重试，避免重复产生远端副作用。
+
+`ssh_start` 未传 `timeoutMs` 时使用目标 `maxTimeoutMs`（不受 `ssh_exec` 的 60 秒默认影响）。长任务到达输出保留上限时不会被终止：Gateway 停止落盘保留并在 `ssh_status` 的 `result` 中返回 `retentionTruncated`/`retentionDroppedBytes`，内存滚动日志（`ssh_tail`）继续接收后续输出，保持原有有界滚动语义（`droppedBytes` 表示滚动缓冲中丢弃的旧字节，与保留截断无关）。
 
 ### 传输文件
 
@@ -331,6 +335,10 @@ ssh_cancel({ "runId": "..." }) -> 取消仍在运行的任务
 Full access 目标（OpenSSH 和 AccessClient）可省略 `localRoot`，直接使用 Gateway 本机和远端的合法绝对路径。建议先以 `dryRun: true` 检查，再明确改为 `false`；`overwrite: true` 具有破坏性。
 
 `ssh_upload`、`ssh_download` 和 `ssh_sync` 都返回 `runId`，通过相同的 `ssh_status`、`ssh_tail` 和 `ssh_cancel` 跟踪。同步只从本机复制到远端，不删除远端多余文件。所有模式仍会执行路径规范化、文件类型检查、配额、校验和、受控发布、超时、取消与审计。
+
+`ssh_sync` 默认参数下可重复执行：`onExisting` 默认为 `skip-identical`，远端内容一致（按大小与 SHA-256 比较）的文件跳过并计入 `skipped`，内容不同的文件不覆盖、不中止任务，计入 `conflicts` 并在任务日志（`ssh_tail`）中记录相对路径；缺失的文件照常上传并计入 `uploaded`。`onExisting: "overwrite"` 用本机内容替换内容不同的远端文件（一致的文件仍跳过计入 `skipped`）；`onExisting: "fail"` 恢复旧的严格语义，遇到任何已存在远端文件立即失败。旧参数兼容：未传 `onExisting` 时 `overwrite: true` 等价于 `"overwrite"` 模式，其余情况（含旧 `verifyExisting`，现已接受为无操作）走默认 `"skip-identical"`；`onExisting` 与 `overwrite: true` 同时给出时，只有 `"overwrite"` 模式允许组合，其余组合返回校验错误。
+
+本机源目录中的符号链接和 junction 默认不跟随：`links` 默认为 `"skip"`，跳过并计入 `skippedLinks`，任务日志记录其相对路径（不含本机绝对路径）；`links: "fail"` 立即失败并在错误信息中给出相对路径。远端路径及祖先目录的符号链接安全检查不受这些选项影响。
 
 ### 机器与 Docker 预检
 

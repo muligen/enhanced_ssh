@@ -7,6 +7,9 @@ export const PROTOCOL_VERSION = 8 as const;
 export const MAX_RPC_FRAME_BYTES = 1_048_576;
 export const MAX_COMMAND_BYTES = 65_536;
 export const MAX_TIMEOUT_MS = 3_600_000;
+// Synchronous `ssh_exec` uses this cap when the caller omits timeoutMs; long
+// tasks started with `task.start` still default to the target's maxTimeoutMs.
+export const DEFAULT_SYNC_EXEC_TIMEOUT_MS = 60_000;
 export const MAX_OUTPUT_READ_BYTES = 65_536;
 export const MAX_INLINE_PREVIEW_BYTES = 8_192;
 export const MAX_TARGET_CHECK_HOSTNAME_LENGTH = 255;
@@ -335,6 +338,12 @@ export const execResultSchema = z
     stderr: outputStreamSummarySchema,
     outputRef: opaqueOutputReferenceSchema.optional(),
     outputExpiresAt: z.iso.datetime({ offset: true }).optional(),
+    // Present only when the gateway stopped persisting output before the
+    // process ended (storage cap or global retention quota). The process kept
+    // running; outputRef holds only the retained prefix. Not related to the
+    // task rolling log's droppedBytes.
+    retentionTruncated: z.boolean().optional(),
+    retentionDroppedBytes: z.number().int().safe().nonnegative().optional(),
   })
   .superRefine((value, context) => {
     if ((value.outputRef === undefined) !== (value.outputExpiresAt === undefined)) {
@@ -352,6 +361,16 @@ export const execResultSchema = z
         code: "custom",
         path: ["outputRef"],
         message: "outputRef is required when an inline output preview is truncated",
+      });
+    }
+    if (
+      value.retentionDroppedBytes !== undefined &&
+      value.retentionTruncated !== true
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["retentionDroppedBytes"],
+        message: "retentionDroppedBytes requires retentionTruncated",
       });
     }
   });
@@ -588,20 +607,49 @@ export const downloadParamsSchema = z.strictObject({
 });
 export type DownloadParams = z.infer<typeof downloadParamsSchema>;
 
-export const syncParamsSchema = z.strictObject({
-  ...transferCommonFields,
-  exclude: z
-    .array(
-      z
-        .string()
-        .min(1)
-        .max(512)
-        .refine((value) => !/[\0\r\n]/u.test(value)),
-    )
-    .max(MAX_TRANSFER_EXCLUDES)
-    .default([]),
-  verifyExisting: z.boolean().default(false),
-});
+export const syncOnExistingSchema = z.enum(["skip-identical", "overwrite", "fail"]);
+export type SyncOnExisting = z.infer<typeof syncOnExistingSchema>;
+export const syncLinksSchema = z.enum(["skip", "fail"]);
+export type SyncLinks = z.infer<typeof syncLinksSchema>;
+
+export const syncParamsSchema = z
+  .strictObject({
+    ...transferCommonFields,
+    exclude: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(512)
+          .refine((value) => !/[\0\r\n]/u.test(value)),
+      )
+      .max(MAX_TRANSFER_EXCLUDES)
+      .default([]),
+    // Legacy switches. Without onExisting: overwrite=true maps to the
+    // "overwrite" mode. verifyExisting is accepted as a legacy no-op:
+    // "skip-identical" and "overwrite" compare size and SHA-256 first and
+    // skip identical files, while "fail" fails on any existing remote file.
+    verifyExisting: z.boolean().default(false),
+    // Default "skip-identical" makes repeated syncs idempotent: identical
+    // remote files are skipped, differing ones are reported as conflicts in
+    // the task log instead of failing the task.
+    onExisting: syncOnExistingSchema.optional(),
+    links: syncLinksSchema.default("skip"),
+  })
+  .superRefine((value, context) => {
+    if (
+      value.overwrite === true &&
+      value.onExisting !== undefined &&
+      value.onExisting !== "overwrite"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["onExisting"],
+        message:
+          'onExisting "skip-identical" and "fail" conflict with overwrite: true; omit overwrite or use onExisting "overwrite"',
+      });
+    }
+  });
 export type SyncParams = z.infer<typeof syncParamsSchema>;
 
 export const targetInspectParamsSchema = targetCheckParamsSchema;

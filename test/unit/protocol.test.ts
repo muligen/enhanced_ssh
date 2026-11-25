@@ -504,6 +504,162 @@ test("exec result requires retained output metadata for truncated previews", () 
   }
 });
 
+test("sync params expose onExisting and links modes with legacy compatibility", () => {
+  const defaults = parseRpcRequest({
+    jsonrpc: "2.0",
+    id: "sync-defaults",
+    method: "transfer.sync",
+    params: {
+      target: "dev-linux",
+      localRoot: "workspace",
+      localPath: "source",
+      remotePath: "/srv/app",
+    },
+  });
+  if (!("links" in defaults.params)) throw new Error("Expected sync params");
+  assert.equal(defaults.params.overwrite, false);
+  assert.equal(defaults.params.verifyExisting, false);
+  assert.equal(defaults.params.links, "skip");
+  assert.equal(defaults.params.onExisting, undefined);
+
+  const onExisting = parseRpcRequest({
+    jsonrpc: "2.0",
+    id: "sync-on-existing",
+    method: "transfer.sync",
+    params: {
+      target: "dev-linux",
+      localRoot: "workspace",
+      localPath: "source",
+      remotePath: "/srv/app",
+      onExisting: "fail",
+      links: "fail",
+    },
+  });
+  if (!("onExisting" in onExisting.params)) {
+    throw new Error("Expected sync params");
+  }
+  assert.equal(onExisting.params.onExisting, "fail");
+  assert.equal(onExisting.params.links, "fail");
+
+  for (const invalid of [
+    "replace",
+    "SKIP-IDENTICAL",
+    "",
+  ]) {
+    assert.throws(() =>
+      parseRpcRequest({
+        jsonrpc: "2.0",
+        id: "sync-invalid-mode",
+        method: "transfer.sync",
+        params: {
+          target: "dev-linux",
+          localRoot: "workspace",
+          localPath: "source",
+          remotePath: "/srv/app",
+          onExisting: invalid,
+        },
+      }),
+    );
+  }
+  for (const invalidLinks of ["follow", "ignore", 3]) {
+    assert.throws(() =>
+      parseRpcRequest({
+        jsonrpc: "2.0",
+        id: "sync-invalid-links",
+        method: "transfer.sync",
+        params: {
+          target: "dev-linux",
+          localRoot: "workspace",
+          localPath: "source",
+          remotePath: "/srv/app",
+          links: invalidLinks,
+        },
+      }),
+    );
+  }
+});
+
+test("sync onExisting wins over legacy flags and rejects clear contradictions", () => {
+  const parse = (params: Record<string, unknown>) =>
+    parseRpcRequest({
+      jsonrpc: "2.0",
+      id: "sync-legacy",
+      method: "transfer.sync",
+      params: {
+        target: "dev-linux",
+        localRoot: "workspace",
+        localPath: "source",
+        remotePath: "/srv/app",
+        ...params,
+      },
+    });
+
+  assert.throws(() => parse({ overwrite: true, onExisting: "skip-identical" }));
+  assert.throws(() => parse({ overwrite: true, onExisting: "fail" }));
+
+  const consistentOverwrite = parse({
+    overwrite: true,
+    onExisting: "overwrite",
+  });
+  if (!("onExisting" in consistentOverwrite.params)) {
+    throw new Error("Expected sync params");
+  }
+  assert.equal(consistentOverwrite.params.onExisting, "overwrite");
+
+  const legacyOverwrite = parse({ overwrite: true });
+  if (!("overwrite" in legacyOverwrite.params)) {
+    throw new Error("Expected sync params");
+  }
+  assert.equal(legacyOverwrite.params.overwrite, true);
+
+  const explicitFalseWithMode = parse({
+    overwrite: false,
+    onExisting: "overwrite",
+  });
+  if (!("onExisting" in explicitFalseWithMode.params)) {
+    throw new Error("Expected sync params");
+  }
+  assert.equal(explicitFalseWithMode.params.onExisting, "overwrite");
+});
+
+test("exec results carry optional retention truncation metadata", () => {
+  const base = {
+    requestId: "exec-retention-1",
+    termination: "exit",
+    exitCode: 0,
+    durationMs: 12,
+    stdout: { text: "ok\n", bytes: 3, inlineTruncated: false },
+    stderr: { text: "", bytes: 0, inlineTruncated: false },
+  } as const;
+  assert.equal(execResultSchema.safeParse(base).success, true);
+  assert.equal(
+    execResultSchema.safeParse({
+      ...base,
+      retentionTruncated: true,
+      retentionDroppedBytes: 4096,
+    }).success,
+    true,
+  );
+  assert.equal(
+    execResultSchema.safeParse({ ...base, retentionTruncated: true }).success,
+    true,
+  );
+  assert.equal(
+    execResultSchema.safeParse({
+      ...base,
+      retentionDroppedBytes: 4096,
+    }).success,
+    false,
+  );
+  assert.equal(
+    execResultSchema.safeParse({
+      ...base,
+      retentionTruncated: "yes",
+    }).success,
+    false,
+  );
+});
+
 test("output chunks use null nextOffset exactly at EOF", () => {
   assert.equal(
     outputChunkSchema.safeParse({

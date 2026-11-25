@@ -6,10 +6,12 @@ import {
   readFile,
   readdir,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 import test from "node:test";
 
 import { TransferService } from "../../src/core/transfer-service.js";
@@ -32,11 +34,12 @@ import type {
 } from "../../src/infra/openssh-executor.js";
 import { GATEWAY_ERROR_CODES, GatewayError } from "../../src/shared/errors.js";
 import { SHARED_SHELL_TRANSFER_CHUNK_BYTES } from "../../src/infra/shared-shell-transfer.js";
-import type {
-  DownloadParams,
-  SyncParams,
-  TargetPlatform,
-  UploadParams,
+import {
+  parseRpcResult,
+  type DownloadParams,
+  type SyncParams,
+  type TargetPlatform,
+  type UploadParams,
 } from "../../src/shared/protocol.js";
 
 class FakeSftpExecutor {
@@ -218,6 +221,7 @@ function syncParams(overrides: Partial<SyncParams> = {}): SyncParams {
     dryRun: false,
     exclude: [],
     verifyExisting: false,
+    links: "skip",
     ...overrides,
   };
 }
@@ -295,6 +299,52 @@ function successfulTransferSsh(contents: Uint8Array | string): FakeSshExecutor {
   );
 }
 
+/**
+ * Answers remote fingerprint probes per relative path under the sync root.
+ * `remoteFiles` maps existing remote files to their content; `stagedParts`
+ * maps the local content that a staged `.agent-ssh-*.part` upload carries, so
+ * post-upload verification succeeds for files that were just transferred.
+ * Unknown paths report the fixed MISSING response.
+ */
+function remoteFingerprintRouter(
+  remoteFiles: Record<string, Uint8Array | string>,
+  stagedParts: Record<string, Uint8Array | string> = {},
+): FakeSshExecutor {
+  return new FakeSshExecutor(async (input) => {
+    if (isUploadPathProbeCall(input)) return sshOutcome({ stdout: "SAFE" });
+    const match =
+      /AGENT_SSH_TRANSFER_PATH='((?:\\.|[^'])*)'/u.exec(
+        structuredCommandText(input),
+      );
+    const remotePath = match?.[1]?.replaceAll(`'\\''`, "'");
+    if (remotePath === undefined) return sshOutcome();
+    const prefix = "/srv/services/app/";
+    if (!remotePath.startsWith(prefix)) return sshOutcome();
+    const relativePath = remotePath.slice(prefix.length);
+    for (const [name, contents] of Object.entries(stagedParts)) {
+      if (
+        relativePath ===
+        `${name}.agent-ssh-${sha256(contents).slice(0, 16)}.part`
+      ) {
+        return sshOutcome({ stdout: fingerprint(contents) });
+      }
+    }
+    const contents = remoteFiles[relativePath];
+    if (contents === undefined) {
+      return sshOutcome({ exitCode: 10, stdout: "MISSING" });
+    }
+    return sshOutcome({ stdout: fingerprint(contents) });
+  });
+}
+
+function missingRemoteSftp(): FakeSftpExecutor {
+  return new FakeSftpExecutor(async (input) =>
+    batchText(input).startsWith("@ls ")
+      ? sftpOutcome({ exitCode: 1 })
+      : sftpOutcome(),
+  );
+}
+
 function sha256(value: Uint8Array | string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -316,6 +366,14 @@ async function waitForTerminal(tasks: TaskStore, runId: string) {
 function hasGatewayCode(code: string): (error: unknown) => boolean {
   return (error: unknown): boolean =>
     error instanceof GatewayError && error.code === code;
+}
+
+function isPermissionDenied(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    ["EPERM", "EACCES"].includes(String((error as NodeJS.ErrnoException).code))
+  );
 }
 
 test("full access preserves rooted upload compatibility", async (t) => {
@@ -1161,8 +1219,11 @@ test("download requires the transferred size to match the remote fingerprint", a
 
 test("sync excludes matching directories and uploads only included files", async (t) => {
   const included = Buffer.from("included", "utf8");
-  const sftp = new FakeSftpExecutor();
-  const ssh = successfulTransferSsh(included);
+  const sftp = missingRemoteSftp();
+  const ssh = remoteFingerprintRouter(
+    { "nested/keep.txt": Buffer.from("older remote version", "utf8") },
+    { "nested/keep.txt": included },
+  );
   const harness = await createHarness({ sftp, ssh });
   t.after(() => rm(harness.directory, { recursive: true, force: true }));
   await Promise.all([
@@ -1187,6 +1248,7 @@ test("sync excludes matching directories and uploads only included files", async
 
   assert.equal(status.state, "succeeded");
   assert.equal(status.result?.files, 1);
+  assert.equal(status.result?.uploaded, 1);
   const batches = sftp.calls.map(batchText).join("\n");
   assert.match(batches, /nested\/keep\.txt/u);
   assert.equal(batches.includes("ignored.txt"), false);
@@ -1340,35 +1402,446 @@ test("sync rejects descendant paths over the safe UTF-8 byte limit", { skip: pro
   assert.equal(harness.ssh.calls.length, 0);
 });
 
-test("sync overwrite false stops before replacing an existing remote file", async (t) => {
-  const events: string[] = [];
+test("sync default options skip identical files so repeated syncs succeed", async (t) => {
+  const contents = Buffer.from("release", "utf8");
+  const remoteFiles: Record<string, Uint8Array | string> = {};
   const harness = await createHarness({
-    ssh: new FakeSshExecutor(async (input) => {
-      assert.equal(isUploadPathProbeCall(input), true);
-      events.push("preflight");
-      return sshOutcome({ stdout: "SAFE" });
-    }),
-    sftp: new FakeSftpExecutor(async (input) => {
-      events.push(batchText(input).startsWith("@ls ") ? "exists" : "sftp");
-      return sftpOutcome();
-    }),
+    ssh: remoteFingerprintRouter(remoteFiles, { "keep.txt": contents }),
+    sftp: missingRemoteSftp(),
   });
   t.after(() => rm(harness.directory, { recursive: true, force: true }));
   await mkdir(path.join(harness.localRoot, "source"));
-  await writeFile(path.join(harness.localRoot, "source", "keep.txt"), "new", "utf8");
+  await writeFile(path.join(harness.localRoot, "source", "keep.txt"), contents);
+
+  const first = harness.service.startSync(syncParams({ resume: false }));
+  const firstStatus = await waitForTerminal(harness.tasks, first.runId);
+  assert.equal(firstStatus.state, "succeeded");
+  assert.deepEqual(firstStatus.result, {
+    dryRun: false,
+    files: 1,
+    bytes: contents.byteLength,
+    uploaded: 1,
+    skipped: 0,
+    conflicts: 0,
+    skippedLinks: 0,
+  });
+  assert.equal(
+    harness.sftp.calls.some((call) => /^@put /mu.test(batchText(call))),
+    true,
+  );
+  const sftpCallsAfterFirstRun = harness.sftp.calls.length;
+
+  remoteFiles["keep.txt"] = contents;
+  const second = harness.service.startSync(syncParams({ resume: false }));
+  const secondStatus = await waitForTerminal(harness.tasks, second.runId);
+  assert.equal(secondStatus.state, "succeeded");
+  assert.deepEqual(secondStatus.result, {
+    dryRun: false,
+    files: 1,
+    bytes: contents.byteLength,
+    uploaded: 0,
+    skipped: 1,
+    conflicts: 0,
+    skippedLinks: 0,
+  });
+  assert.equal(harness.sftp.calls.length, sftpCallsAfterFirstRun);
+});
+
+test("sync default keeps differing remote files as counted conflicts without failing", async (t) => {
+  const local = Buffer.from("local-version", "utf8");
+  const harness = await createHarness({
+    ssh: remoteFingerprintRouter({
+      "a/changed.txt": Buffer.from("remote-version", "utf8"),
+      "a/same.txt": local,
+    }),
+  });
+  t.after(() => rm(harness.directory, { recursive: true, force: true }));
+  await mkdir(path.join(harness.localRoot, "source", "a"), { recursive: true });
+  await Promise.all([
+    writeFile(path.join(harness.localRoot, "source", "a", "changed.txt"), local),
+    writeFile(path.join(harness.localRoot, "source", "a", "same.txt"), local),
+  ]);
+
+  const started = harness.service.startSync(syncParams({ resume: false }));
+  const status = await waitForTerminal(harness.tasks, started.runId);
+
+  assert.equal(status.state, "succeeded");
+  assert.deepEqual(status.result, {
+    dryRun: false,
+    files: 2,
+    bytes: local.byteLength * 2,
+    uploaded: 0,
+    skipped: 1,
+    conflicts: 1,
+    skippedLinks: 0,
+  });
+  assert.equal(harness.sftp.calls.length, 0);
+  const tail = harness.tasks.tail(started.runId, undefined, 65_536);
+  assert.match(
+    tail.stdout.text,
+    /Sync conflict \(kept remote file\): a\/changed\.txt/u,
+  );
+  assert.equal(tail.stdout.text.includes(harness.localRoot), false);
+});
+
+test("sync onExisting overwrite replaces differing files and skips identical ones", async (t) => {
+  const local = Buffer.from("local-version", "utf8");
+  const harness = await createHarness({
+    ssh: remoteFingerprintRouter(
+      {
+        "changed.txt": Buffer.from("remote-version", "utf8"),
+        "same.txt": local,
+      },
+      { "changed.txt": local },
+    ),
+    sftp: missingRemoteSftp(),
+  });
+  t.after(() => rm(harness.directory, { recursive: true, force: true }));
+  await mkdir(path.join(harness.localRoot, "source"));
+  await Promise.all([
+    writeFile(path.join(harness.localRoot, "source", "changed.txt"), local),
+    writeFile(path.join(harness.localRoot, "source", "same.txt"), local),
+  ]);
 
   const started = harness.service.startSync(
-    syncParams({ overwrite: false, resume: false }),
+    syncParams({ onExisting: "overwrite", resume: false }),
+  );
+  const status = await waitForTerminal(harness.tasks, started.runId);
+
+  assert.equal(status.state, "succeeded");
+  assert.deepEqual(status.result, {
+    dryRun: false,
+    files: 2,
+    bytes: local.byteLength * 2,
+    uploaded: 1,
+    skipped: 1,
+    conflicts: 0,
+    skippedLinks: 0,
+  });
+  const batches = harness.sftp.calls.map(batchText).join("\n");
+  assert.match(batches, /changed\.txt/u);
+  assert.equal(batches.includes("same.txt"), false);
+  assert.match(batches, /@rm/u);
+});
+
+test("sync onExisting fail reports the conflicting relative path and stops", async (t) => {
+  const harness = await createHarness({
+    ssh: remoteFingerprintRouter({ "keep.txt": Buffer.from("existing") }),
+  });
+  t.after(() => rm(harness.directory, { recursive: true, force: true }));
+  await mkdir(path.join(harness.localRoot, "source"));
+  await writeFile(path.join(harness.localRoot, "source", "keep.txt"), "new");
+
+  const started = harness.service.startSync(
+    syncParams({ onExisting: "fail", resume: false }),
   );
   const status = await waitForTerminal(harness.tasks, started.runId);
 
   assert.equal(status.state, "failed");
-  assert.equal(status.error?.gatewayCode, "TRANSFER_FAILED");
-  assert.deepEqual(events, ["preflight", "exists"]);
+  assert.equal(status.error?.gatewayCode, GATEWAY_ERROR_CODES.transferFailed);
+  assert.match(
+    status.error?.message ?? "",
+    /Remote file already exists: keep\.txt/u,
+  );
   assert.equal(
     harness.sftp.calls.some((call) => /^@put /mu.test(batchText(call))),
     false,
   );
+});
+
+test("sync dryRun counts skipped links, logs them, and uploads nothing", async (t) => {
+  const harness = await createHarness({
+    ssh: remoteFingerprintRouter({}),
+  });
+  t.after(() => rm(harness.directory, { recursive: true, force: true }));
+  await mkdir(path.join(harness.localRoot, "source", "nested"), {
+    recursive: true,
+  });
+  await writeFile(
+    path.join(harness.localRoot, "source", "nested", "keep.txt"),
+    "payload",
+  );
+  try {
+    await symlink(
+      path.join(harness.localRoot, "source", "nested"),
+      path.join(harness.localRoot, "source", "linked-dir"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch (error: unknown) {
+    if (isPermissionDenied(error)) {
+      t.skip("creating a test reparse point is not permitted on this host");
+      return;
+    }
+    throw error;
+  }
+
+  const started = harness.service.startSync(syncParams({ dryRun: true }));
+  const status = await waitForTerminal(harness.tasks, started.runId);
+  assert.equal(status.state, "succeeded");
+  assert.deepEqual(status.result, {
+    dryRun: true,
+    files: 1,
+    bytes: 7,
+    uploaded: 0,
+    skipped: 0,
+    conflicts: 0,
+    skippedLinks: 1,
+  });
+  const tail = harness.tasks.tail(started.runId, undefined, 65_536);
+  assert.match(tail.stdout.text, /Skipped link: linked-dir/u);
+  assert.equal(harness.sftp.calls.length, 0);
+  assert.equal(harness.ssh.calls.length, 0);
+});
+
+test("sync skips local links by default and reports their relative paths", async (t) => {
+  const contents = Buffer.from("payload", "utf8");
+  const harness = await createHarness({
+    ssh: remoteFingerprintRouter({}, { "nested/keep.txt": contents }),
+    sftp: missingRemoteSftp(),
+  });
+  t.after(() => rm(harness.directory, { recursive: true, force: true }));
+  await mkdir(path.join(harness.localRoot, "source", "nested"), {
+    recursive: true,
+  });
+  await writeFile(
+    path.join(harness.localRoot, "source", "nested", "keep.txt"),
+    contents,
+  );
+
+  let fileLinkCreated = false;
+  if (process.platform !== "win32") {
+    await symlink(
+      path.join(harness.localRoot, "source", "nested", "keep.txt"),
+      path.join(harness.localRoot, "source", "link.bin"),
+      "file",
+    );
+    fileLinkCreated = true;
+  }
+  try {
+    await symlink(
+      path.join(harness.localRoot, "source", "nested"),
+      path.join(harness.localRoot, "source", "linked-dir"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch (error: unknown) {
+    if (isPermissionDenied(error)) {
+      t.skip("creating a test reparse point is not permitted on this host");
+      return;
+    }
+    throw error;
+  }
+
+  const started = harness.service.startSync(syncParams({ resume: false }));
+  const status = await waitForTerminal(harness.tasks, started.runId);
+
+  assert.equal(status.state, "succeeded");
+  assert.equal(status.result?.uploaded, 1);
+  assert.equal(status.result?.skippedLinks, fileLinkCreated ? 2 : 1);
+  const tail = harness.tasks.tail(started.runId, undefined, 65_536);
+  if (fileLinkCreated) {
+    assert.match(tail.stdout.text, /Skipped link: link\.bin/u);
+  }
+  assert.match(tail.stdout.text, /Skipped link: linked-dir/u);
+  assert.equal(tail.stdout.text.includes(harness.localRoot), false);
+  const batches = harness.sftp.calls.map(batchText).join("\n");
+  assert.match(batches, /nested\/keep\.txt/u);
+  assert.equal(batches.includes("link.bin"), false);
+  assert.equal(batches.includes("linked-dir"), false);
+});
+
+test("sync links fail reports the link relative path without local absolute paths", async (t) => {
+  const harness = await createHarness({
+    ssh: remoteFingerprintRouter({}),
+  });
+  t.after(() => rm(harness.directory, { recursive: true, force: true }));
+  await mkdir(path.join(harness.localRoot, "source", "nested"), {
+    recursive: true,
+  });
+  await writeFile(path.join(harness.localRoot, "source", "nested", "keep.txt"), "x");
+  try {
+    await symlink(
+      path.join(harness.localRoot, "source", "nested"),
+      path.join(harness.localRoot, "source", "linked-dir"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch (error: unknown) {
+    if (isPermissionDenied(error)) {
+      t.skip("creating a test reparse point is not permitted on this host");
+      return;
+    }
+    throw error;
+  }
+
+  const started = harness.service.startSync(
+    syncParams({ links: "fail", resume: false }),
+  );
+  const status = await waitForTerminal(harness.tasks, started.runId);
+
+  assert.equal(status.state, "failed");
+  assert.equal(status.error?.gatewayCode, GATEWAY_ERROR_CODES.transferFailed);
+  assert.match(
+    status.error?.message ?? "",
+    /symbolic link or reparse point: linked-dir/u,
+  );
+  assert.equal((status.error?.message ?? "").includes(harness.localRoot), false);
+  assert.equal(harness.sftp.calls.length, 0);
+});
+
+test("sync failure messages stay within the task status schema for long paths", async (t) => {
+  const longRelative = `dir/${"x".repeat(220)}/keep.txt`;
+  const failing = await createHarness({
+    ssh: remoteFingerprintRouter({ [longRelative]: Buffer.from("existing") }),
+  });
+  t.after(() => rm(failing.directory, { recursive: true, force: true }));
+  await mkdir(path.join(failing.localRoot, "source", "dir", "x".repeat(220)), {
+    recursive: true,
+  });
+  await writeFile(
+    path.join(failing.localRoot, "source", longRelative),
+    "new",
+  );
+
+  const conflict = failing.service.startSync(
+    syncParams({ onExisting: "fail", resume: false }),
+  );
+  const conflictStatus = await waitForTerminal(failing.tasks, conflict.runId);
+  assert.equal(conflictStatus.state, "failed");
+  assert.match(conflictStatus.error?.message ?? "", /\.\.\.$/u);
+  parseRpcResult("task.status", conflictStatus);
+
+  const linked = await createHarness({
+    ssh: remoteFingerprintRouter({}),
+  });
+  t.after(() => rm(linked.directory, { recursive: true, force: true }));
+  await mkdir(
+    path.join(linked.localRoot, "source", "long-a", "y".repeat(200)),
+    { recursive: true },
+  );
+  await writeFile(
+    path.join(linked.localRoot, "source", "long-a", "y".repeat(200), "leaf.txt"),
+    "x",
+  );
+  await symlink(
+    path.join(linked.localRoot, "source", "long-a"),
+    path.join(linked.localRoot, "source", "long-a", "y".repeat(200), "linked"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+
+  const link = linked.service.startSync(
+    syncParams({ links: "fail", resume: false }),
+  );
+  const linkStatus = await waitForTerminal(linked.tasks, link.runId);
+  assert.equal(linkStatus.state, "failed");
+  const linkMessage = linkStatus.error?.message ?? "";
+  assert.match(linkMessage, /symbolic link or reparse point: long-a\//u);
+  assert.match(linkMessage, /\.\.\.$/u);
+  assert.ok(Buffer.byteLength(linkMessage, "utf8") <= 256);
+  parseRpcResult("task.status", linkStatus);
+});
+
+test(
+  "sync paths with control characters cannot forge logs or failure messages",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const hostileName = "bad\nname.txt";
+    const harness = await createHarness({
+      ssh: remoteFingerprintRouter({ [hostileName]: Buffer.from("existing") }),
+    });
+    t.after(() => rm(harness.directory, { recursive: true, force: true }));
+    await mkdir(path.join(harness.localRoot, "source"));
+    await writeFile(
+      path.join(harness.localRoot, "source", hostileName),
+      "new",
+    );
+
+    const started = harness.service.startSync(
+      syncParams({ onExisting: "fail", resume: false }),
+    );
+    const status = await waitForTerminal(harness.tasks, started.runId);
+
+    assert.equal(status.state, "failed");
+    const message = status.error?.message ?? "";
+    assert.equal(message.includes("\n"), false);
+    assert.equal(message.includes("\\u000a"), true);
+    parseRpcResult("task.status", status);
+
+    const linked = await createHarness({
+      ssh: remoteFingerprintRouter({}),
+    });
+    t.after(() => rm(linked.directory, { recursive: true, force: true }));
+    await mkdir(path.join(linked.localRoot, "source", "nested"), {
+      recursive: true,
+    });
+    await symlink(
+      path.join(linked.localRoot, "source", "nested"),
+      path.join(linked.localRoot, "source", "lin\nk"),
+      "dir",
+    );
+
+    const skipRun = linked.service.startSync(syncParams({ dryRun: true }));
+    const skipStatus = await waitForTerminal(linked.tasks, skipRun.runId);
+    assert.equal(skipStatus.state, "succeeded");
+    const tail = linked.tasks.tail(skipRun.runId, undefined, 65_536);
+    assert.equal(tail.stdout.text.includes("lin\nk"), false);
+    assert.match(tail.stdout.text, /Skipped link: lin\\u000a/u);
+  },
+);
+
+test("AccessClient sync skips identical remote files through the shared shell", async (t) => {
+  const contents = Buffer.from("shared-shell-sync", "utf8");
+  let fingerprintCalls = 0;
+  const remoteFiles: Record<string, Uint8Array | string> = {};
+  const writtenChunks: Buffer[] = [];
+  const ssh = new FakeSshExecutor(async (input) => {
+    if (input.command.includes("/bin/cat")) {
+      writtenChunks.push(Buffer.from(input.stdin ?? []));
+      return sshOutcome();
+    }
+    if (isUploadPathProbeCall(input)) return sshOutcome({ stdout: "SAFE" });
+    const script = structuredCommandText(input);
+    if (script.includes("sha256sum")) {
+      fingerprintCalls += 1;
+      const match =
+        /AGENT_SSH_TRANSFER_PATH='((?:\\.|[^'])*)'/u.exec(script);
+      const remotePath = match?.[1];
+      if (remotePath?.endsWith(".part")) {
+        // The staged partial carries the local content.
+        return sshOutcome({ stdout: fingerprint(contents) });
+      }
+      const relativePath = remotePath?.startsWith("/srv/services/app/")
+        ? remotePath.slice("/srv/services/app/".length)
+        : undefined;
+      const known = relativePath === undefined
+        ? undefined
+        : remoteFiles[relativePath];
+      if (known === undefined) {
+        return sshOutcome({ exitCode: 10, stdout: "MISSING" });
+      }
+      return sshOutcome({ stdout: fingerprint(known) });
+    }
+    return sshOutcome();
+  });
+  const harness = await createHarness({ accessClient: true, ssh });
+  t.after(() => rm(harness.directory, { recursive: true, force: true }));
+  await mkdir(path.join(harness.localRoot, "source"));
+  await writeFile(path.join(harness.localRoot, "source", "keep.txt"), contents);
+
+  const first = harness.service.startSync(syncParams({ resume: false }));
+  const firstStatus = await waitForTerminal(harness.tasks, first.runId);
+  assert.equal(firstStatus.state, "succeeded");
+  assert.equal(firstStatus.result?.uploaded, 1);
+  assert.equal(harness.sftp.calls.length, 0);
+  assert.deepEqual(Buffer.concat(writtenChunks), contents);
+
+  remoteFiles["keep.txt"] = contents;
+  const fingerprintCallsBeforeSkip = fingerprintCalls;
+  const second = harness.service.startSync(syncParams({ resume: false }));
+  const secondStatus = await waitForTerminal(harness.tasks, second.runId);
+  assert.equal(secondStatus.state, "succeeded");
+  assert.equal(secondStatus.result?.uploaded, 0);
+  assert.equal(secondStatus.result?.skipped, 1);
+  assert.equal(writtenChunks.length, 1);
+  assert.ok(fingerprintCalls > fingerprintCallsBeforeSkip);
 });
 
 test("service startup removes abandoned upload staging and download locks", async (t) => {

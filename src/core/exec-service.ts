@@ -56,6 +56,7 @@ import type {
   DockerPreflightResult,
 } from "../shared/protocol.js";
 import {
+  DEFAULT_SYNC_EXEC_TIMEOUT_MS,
   MAX_TARGET_CHECK_HOSTNAME_LENGTH,
   targetCheckFailureReasonSchema,
 } from "../shared/protocol.js";
@@ -319,7 +320,10 @@ export class ExecService {
     requestId: RpcId,
     params: RpcParamsByMethod["exec.run"],
   ): Promise<ExecResult> {
-    const prepared = this.#prepareRun(params);
+    // Synchronous executions default to a bounded timeout so a forgotten
+    // timeoutMs cannot hold the caller (or the shared AccessClient session)
+    // for up to an hour; explicit values are still capped by the target.
+    const prepared = this.#prepareRun(params, DEFAULT_SYNC_EXEC_TIMEOUT_MS);
     return this.#startExecution(
       caller,
       requestId,
@@ -364,6 +368,16 @@ export class ExecService {
               durationMs: result.durationMs,
               stdoutBytes: result.stdout.bytes,
               stderrBytes: result.stderr.bytes,
+              ...(result.retentionTruncated === true
+                ? {
+                    retentionTruncated: true,
+                    ...(result.retentionDroppedBytes === undefined
+                      ? {}
+                      : {
+                          retentionDroppedBytes: result.retentionDroppedBytes,
+                        }),
+                  }
+                : {}),
               ...(result.outputRef === undefined
                 ? {}
                 : {
@@ -395,14 +409,23 @@ export class ExecService {
     return this.#taskStore.cancel(runId);
   }
 
-  #prepareRun(params: RpcParamsByMethod["exec.run"]): PreparedExecution {
+  #prepareRun(
+    params: RpcParamsByMethod["exec.run"],
+    defaultTimeoutCapMs?: number,
+  ): PreparedExecution {
     this.#assertExecutionAvailable();
     const generation = this.#generation;
+    const defaultTimeoutMs = defaultTimeoutCapMs === undefined
+      ? undefined
+      : Math.min(
+          generation.registry.require(params.target).maxTimeoutMs,
+          defaultTimeoutCapMs,
+        );
     if ("command" in params) {
       const authorization = generation.registry.authorize(
         params.target,
         params.command,
-        params.timeoutMs,
+        params.timeoutMs ?? defaultTimeoutMs,
       );
       return {
         authorization,
@@ -417,7 +440,7 @@ export class ExecService {
 
     const authorization = generation.registry.authorizeStructured(
       params.target,
-      params.timeoutMs,
+      params.timeoutMs ?? defaultTimeoutMs,
     );
     return {
       authorization,
@@ -1106,23 +1129,42 @@ export class ExecService {
       let outcome: SshOutcome;
       let termination: ExecResult["termination"];
       let outputBytes = 0;
+      let pendingAppends = 0;
+      let sinkFailed = false;
       try {
-        const outputSink =
-          observeOutput === undefined && maximumOutputBytes === undefined
-            ? sink
-            : {
-                append: async (
-                  stream: TaskOutputStream,
-                  chunk: Uint8Array,
-                ): Promise<void> => {
-                  outputBytes += chunk.byteLength;
-                  if (maximumOutputBytes !== undefined && outputBytes > maximumOutputBytes) {
-                    throw new OutputLimitExceededError(maximumOutputBytes, outputBytes - chunk.byteLength, chunk.byteLength);
-                  }
-                  await sink.append(stream, chunk);
-                  observeOutput?.(stream, chunk);
-                },
-              };
+        // Every executor awaits its sink appends before run() resolves, so a
+        // zero pendingAppends count after run() proves the sink's write queue
+        // has drained and finalize() cannot hang.
+        const outputSink = {
+          append: async (
+            stream: TaskOutputStream,
+            chunk: Uint8Array,
+          ): Promise<void> => {
+            pendingAppends += 1;
+            try {
+              outputBytes += chunk.byteLength;
+              if (
+                maximumOutputBytes !== undefined &&
+                outputBytes > maximumOutputBytes
+              ) {
+                throw new OutputLimitExceededError(
+                  maximumOutputBytes,
+                  outputBytes - chunk.byteLength,
+                  chunk.byteLength,
+                );
+              }
+              try {
+                await sink.append(stream, chunk);
+              } catch (error) {
+                sinkFailed = true;
+                throw error;
+              }
+              observeOutput?.(stream, chunk);
+            } finally {
+              pendingAppends -= 1;
+            }
+          },
+        };
         outcome = await executor.run({
           sshAlias: authorization.target.sshAlias,
           ...remoteCommand,
@@ -1133,6 +1175,9 @@ export class ExecService {
         termination = active.reason ?? (outcome.aborted ? "cancel" : "exit");
       } catch (error) {
         if (findCause(error, OutputLimitExceededError) !== undefined) {
+          // Only explicit per-call output caps (preset operations) reach this
+          // path. Retention limits no longer terminate; the sink itself stops
+          // persisting and marks the result instead.
           this.#requestStop(active, "output_limit");
           termination = active.reason ?? "output_limit";
         } else if (error instanceof SshExecutionError) {
@@ -1146,8 +1191,17 @@ export class ExecService {
         active.acceptingCancellation = false;
       }
 
+      // Timeout and cancel keep the partial output for diagnostics, but only
+      // once the sink's write queue has drained: a permanently blocked sink
+      // must never delay the result, so it is quarantined instead. A sink
+      // that already failed also stays quarantined: finalize() would rethrow
+      // its fatal I/O error and skip the completion audit.
+      // Spawn errors keep the historical discard behavior because the sink
+      // itself may be the failure source.
       const output =
-        termination === "exit" || termination === "output_limit"
+        pendingAppends === 0 &&
+        !sinkFailed &&
+        termination !== "spawn_error"
           ? await sink.finalize()
           : discardOutputSink(sink);
       sinkDispositionChosen = true;
@@ -1173,6 +1227,7 @@ export class ExecService {
         stderrBytes: output.stderr.bytes,
         truncated:
           termination === "output_limit" ||
+          output.retentionTruncated === true ||
           output.stdout.inlineTruncated ||
           output.stderr.inlineTruncated,
       });
@@ -1189,6 +1244,16 @@ export class ExecService {
           durationMs,
           stdout: output.stdout,
           stderr: output.stderr,
+          ...(output.retentionTruncated === true
+            ? {
+                retentionTruncated: true,
+                ...(output.retentionDroppedBytes === undefined
+                  ? {}
+                  : {
+                      retentionDroppedBytes: output.retentionDroppedBytes,
+                    }),
+              }
+            : {}),
           ...(output.outputRef === undefined
             ? {}
             : {
@@ -1325,7 +1390,12 @@ function toTargetCheckResult(
   failureReason?: TargetCheckFailureReason,
 ): TargetCheckResult {
   const connected = result.termination === "exit" && result.exitCode === 0;
-  const hostname = connected ? extractSafeHostname(result.stdout.text) : undefined;
+  // A retention-truncated probe output can cut the hostname mid-value, so it
+  // is withheld rather than reporting a prefix as a trusted hostname.
+  const hostname =
+    connected && result.retentionTruncated !== true
+      ? extractSafeHostname(result.stdout.text)
+      : undefined;
   return {
     target,
     connected,

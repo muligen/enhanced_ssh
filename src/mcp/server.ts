@@ -247,7 +247,7 @@ export function createMcpServer(
     "ssh_exec",
     {
       description:
-        "Run a command synchronously on an SSH target. Accepts the compatible single command form or a full-access structured shell/script/cwd/env form. On allow-list targets, command must exactly equal one approved command string as a whole: there is no prefix, pattern, or argument matching, so any extra space or argument is denied, and the structured form is rejected. If timeoutMs is omitted, the target's full maxTimeoutMs is used (see ssh_list_targets; up to 1 hour). Use ssh_start instead for builds, installs, downloads, and other long-running work. On an AccessClient target, commands share one session and run one at a time in FIFO order (file transfers to that target use the same queue); time spent waiting counts toward timeoutMs.",
+        "Run a command synchronously on an SSH target. Accepts the compatible single command form or a full-access structured shell/script/cwd/env form. On allow-list targets, command must exactly equal one approved command string as a whole: there is no prefix, pattern, or argument matching, so any extra space or argument is denied, and the structured form is rejected. If timeoutMs is omitted, a 60-second default applies, still capped by the target's maxTimeoutMs (see ssh_list_targets). If the execution ends by timeout or cancellation, the result still carries the stdout/stderr received so far, plus outputRef when retention was needed. Retained output is capped per execution (10 MiB on managed targets); when the cap or the global retention quota is reached the process keeps running and the result reports retentionTruncated with retentionDroppedBytes, so outputRef may hold only a prefix. Use ssh_start instead for builds, installs, downloads, and other long-running work. On an AccessClient target, commands share one session and run one at a time in FIFO order (file transfers to that target use the same queue); time spent waiting counts toward timeoutMs.",
       inputSchema: execRunParamsSchema,
       outputSchema: execResultSchema,
       annotations: {
@@ -271,7 +271,7 @@ export function createMcpServer(
     "ssh_start",
     {
       description:
-        "Start a daemon-owned SSH execution and return a runId immediately. The task continues across MCP client disconnects; use ssh_status and ssh_tail to follow it. Accepts the same forms and policy rules as ssh_exec. If the start response is missing or uncertain (for example after a transport error or timeout), do not retry automatically: the first request may already have started the task, and a retry can repeat its remote side effects. On an AccessClient target, a running task holds the target's single shared session, so later commands and transfers on that target wait in FIFO order.",
+        "Start a daemon-owned SSH execution and return a runId immediately. The task continues across MCP client disconnects; use ssh_status and ssh_tail to follow it. Accepts the same forms and policy rules as ssh_exec, except an omitted timeoutMs uses the target's full maxTimeoutMs (long tasks are not limited to ssh_exec's 60-second default). Long tasks are not terminated when output retention fills: the gateway stops persisting retained output (10 MiB per execution on managed targets, plus a global quota), marks status.result with retentionTruncated and retentionDroppedBytes, and the rolling ssh_tail log keeps receiving subsequent output. If the start response is missing or uncertain (for example after a transport error or timeout), do not retry automatically: the first request may already have started the task, and a retry can repeat its remote side effects. On an AccessClient target, a running task holds the target's single shared session, so later commands and transfers on that target wait in FIFO order.",
       inputSchema: execRunParamsSchema,
       outputSchema: taskStartResultSchema,
       annotations: {
@@ -294,7 +294,8 @@ export function createMcpServer(
   server.registerTool(
     "ssh_status",
     {
-      description: "Read the current state and progress counters of a daemon-owned SSH task.",
+      description:
+        "Read the current state and progress counters of a daemon-owned SSH task. Exec tasks expose durationMs, stdoutBytes, stderrBytes, plus retentionTruncated/retentionDroppedBytes whenever the gateway stopped persisting output before the process ended (possible with or without an outputRef, e.g. when the global quota was already full), and outputRef/outputExpiresAt when a prefix was retained (retentionTruncated true means that prefix is incomplete). Sync tasks report files/bytes plus uploaded, skipped, conflicts and skippedLinks counts.",
       inputSchema: taskStatusParamsSchema,
       outputSchema: taskStatusResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
@@ -311,7 +312,7 @@ export function createMcpServer(
     "ssh_tail",
     {
       description:
-        "Read new UTF-8 stdout and stderr from a daemon-owned task using an opaque cursor. No Base64 decoding or byte-offset bookkeeping is required. Task logs are a bounded rolling buffer: check each stream's droppedBytes (non-zero means that much older output was discarded before this read and is missing from text) and hadDecodingErrors (true means the bytes were not valid UTF-8 and text contains replacement characters, so it is not an exact copy).",
+        "Read new UTF-8 stdout and stderr from a daemon-owned task using an opaque cursor. No Base64 decoding or byte-offset bookkeeping is required. Task logs are a bounded rolling buffer: check each stream's droppedBytes (non-zero means that much older output was discarded before this read and is missing from text) and hadDecodingErrors (true means the bytes were not valid UTF-8 and text contains replacement characters, so it is not an exact copy). Directory syncs log conflicts as \"Sync conflict (kept remote file): <relativePath>\" and skipped links as \"Skipped link: <relativePath>\".",
       inputSchema: taskTailParamsSchema,
       outputSchema: taskTailResultSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
@@ -388,7 +389,7 @@ export function createMcpServer(
     "ssh_sync",
     {
       description:
-        "Start a non-destructive one-way local-to-remote directory sync. OpenSSH targets use SFTP; AccessClient targets reuse the persistent shared shell. Restricted targets require an approved localRoot and relative localPath. Full-access targets may omit localRoot and use a gateway-local absolute localPath. Transfer timeout is independent from command timeout: omit timeoutMs to use maxTransferTimeoutMs, or supply a value no greater than it. Supports exclusions and dryRun.",
+        "Start a non-destructive one-way local-to-remote directory sync. OpenSSH targets use SFTP; AccessClient targets reuse the persistent shared shell. Restricted targets require an approved localRoot and relative localPath. Full-access targets may omit localRoot and use a gateway-local absolute localPath. Transfer timeout is independent from command timeout: omit timeoutMs to use maxTransferTimeoutMs, or supply a value no greater than it. Supports exclusions and dryRun. Repeated syncs are safe by default: onExisting defaults to skip-identical, which skips files whose remote SHA-256 matches and records differing ones as conflicts (counted in conflicts, relative paths in the ssh_tail log) without failing the task; onExisting \"overwrite\" replaces differing files (identical files are still skipped and counted), and \"fail\" restores the old strict failure on any existing remote file. Legacy overwrite/verifyExisting parameters still parse: without onExisting, overwrite=true maps to the overwrite mode and verifyExisting is accepted as a legacy no-op. Both \"skip-identical\" and \"overwrite\" compare size and SHA-256 first and skip identical files; \"fail\" fails on any existing remote file, identical or not. links defaults to skip: local symlinks and junctions are never followed and are counted in skippedLinks with their relative paths in the task log; links \"fail\" fails the task with that relative path. Results report uploaded, skipped, conflicts and skippedLinks counts.",
       inputSchema: syncParamsSchema,
       outputSchema: taskStartResultSchema,
       annotations: {
